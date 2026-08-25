@@ -1,0 +1,130 @@
+name: Test, and rebuild on a new upstream release
+
+# Follows upstream's STABLE releases (vX.Y.Z) and nothing else. Upstream also
+# publishes :latest and :dev, which move whenever their main branch moves; a Flux
+# app pinned to a rolling tag gets its containers rebuilt onto unreleased code and
+# every customer's server restarted with it. So this workflow reads the newest
+# stable tag, compares it with the base version recorded on our published image,
+# and only rebuilds when a genuinely new release exists.
+
+on:
+  schedule:
+    # Daily. It costs one API call on the days nothing was released.
+    - cron: '0 6 * * *'
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: 'Upstream tag to build (e.g. v2.7.2). Blank = newest stable.'
+        required: false
+        default: ''
+
+env:
+  IMAGE_NAME: runonflux/palworld-server-flux
+  BASE_REPO: thijsvanloef/palworld-server-docker
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: for f in scripts/*.sh tests/*.sh; do bash -n "$f"; done
+
+      - name: Shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -x scripts/*.sh tests/*.sh
+
+      - name: Unit tests
+        run: ./tests/test-flux.sh
+
+  build:
+    needs: test
+    # A pull request gets the tests and nothing else: it must not publish.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the newest stable upstream release
+        id: latest
+        run: |
+          OVERRIDE="${{ github.event.inputs.force_version }}"
+          if [ -n "$OVERRIDE" ]; then
+            LATEST="$OVERRIDE"
+          else
+            # Only vX.Y.Z. The floating aliases (latest, dev, v2, v2.7) and any
+            # pre-release tag are deliberately excluded.
+            LATEST=$(curl -fsSL "https://hub.docker.com/v2/repositories/${BASE_REPO}/tags?page_size=100&ordering=last_updated" \
+              | jq -r '.results[].name' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -1)
+          fi
+          if [ -z "$LATEST" ]; then
+            echo "::error::Could not resolve a stable vX.Y.Z tag for ${BASE_REPO}"
+            exit 1
+          fi
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Newest stable upstream release: $LATEST"
+
+      - name: Read the base version recorded on our published image
+        id: current
+        run: |
+          # Read it back from the REGISTRY, not from `docker inspect`: a fresh
+          # runner has pulled nothing, so a local inspect always looks empty and
+          # would force a rebuild every night.
+          CURRENT=$(docker buildx imagetools inspect "${IMAGE_NAME}:latest" \
+            --format '{{ index .Image.Config.Labels "org.opencontainers.image.base.version" }}' 2>/dev/null || echo "")
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Currently published base version: ${CURRENT:-<none>}"
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Trigger is ${{ github.event_name }} -> build (our own scripts may have changed)"
+          elif [ "${{ steps.latest.outputs.version }}" != "${{ steps.current.outputs.version }}" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream released ${{ steps.latest.outputs.version }} -> build"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Already on ${{ steps.latest.outputs.version }} -> skip"
+          fi
+
+      - name: Checkout
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            PALWORLD_VERSION=${{ steps.latest.outputs.version }}
+            FLUX_IMAGE_VERSION=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.base.name=docker.io/${{ env.BASE_REPO }}:${{ steps.latest.outputs.version }}
+            org.opencontainers.image.base.version=${{ steps.latest.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
