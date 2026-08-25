@@ -94,7 +94,7 @@ flux_guard_sample() {
     auth_ok=1
   fi
 
-  rxq="$(flux_udp_rxq)"
+  rxq="$(flux_udp_rxq "${PORT:-8211}")"
   save_present="$(flux_save_present)"
   # A server that has never had a save is a server whose world has not been
   # written yet, not a server that lost one.

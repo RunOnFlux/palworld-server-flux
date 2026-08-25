@@ -57,8 +57,11 @@ flux_log_rotate() {
   [ -f "${FLUX_GUARD_LOG}" ] || return 0
   lines=$(wc -l <"${FLUX_GUARD_LOG}" 2>/dev/null || echo 0)
   [ "${lines:-0}" -gt "${FLUX_GUARD_LOG_MAX_LINES}" ] || return 0
-  tail -n "$((FLUX_GUARD_LOG_MAX_LINES / 2))" "${FLUX_GUARD_LOG}" >"${FLUX_GUARD_LOG}.tmp" 2>/dev/null &&
-    mv "${FLUX_GUARD_LOG}.tmp" "${FLUX_GUARD_LOG}" 2>/dev/null || true
+  if tail -n "$((FLUX_GUARD_LOG_MAX_LINES / 2))" "${FLUX_GUARD_LOG}" >"${FLUX_GUARD_LOG}.tmp" 2>/dev/null; then
+    mv "${FLUX_GUARD_LOG}.tmp" "${FLUX_GUARD_LOG}" 2>/dev/null || rm -f "${FLUX_GUARD_LOG}.tmp"
+  else
+    rm -f "${FLUX_GUARD_LOG}.tmp"
+  fi
 }
 
 # --- admin password ---------------------------------------------------------
