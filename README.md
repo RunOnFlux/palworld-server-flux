@@ -133,9 +133,12 @@ Two deliberate differences from the PR:
   `RCON_ENABLED=true` (off by default, and deprecated upstream) and a password with
   those characters in it.
 
-It also makes the `ADMIN_PASSWORD=$(sed ...)` prefix we inject into the cron
-expression from the website unnecessary. Leave it: it sets the same value from the
-same file, and removing it is a spec change for 179 live servers.
+It also makes redundant the workaround this fleet has been carrying: an
+`ADMIN_PASSWORD=$(sed ...)` prefix injected into the cron expression itself, so
+that the reboot job could read the password out of the ini at run time. On this
+image a plain `0 5 * * *` works. The prefix stays harmless where it already
+exists — it sets the same value from the same file — so there is no need to
+rewrite specs that carry it.
 
 ## How a broken server comes back
 
@@ -266,10 +269,8 @@ Needs `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as repository secrets.
 1. Build, then run a server on the new image with `FLUX_GUARD_DRY_RUN=true` and
    read `flux-guard.log` for a few days. False positives are the only real risk
    here, and dry run is how you find them without restarting anyone.
-2. Point the marketplace app at the new image
-   (`cloudadminmaster/flux-app-palworld.json`, `repotag`). New deploys only.
-3. Existing servers need their own spec updated, which only the owner can sign.
-   The dashboard's "Server update available" flow
-   (`palworldwebsitemaster/src/config/serverMaintenance.js`) is the machinery for
-   that, but it only knows how to offer env changes today; offering an image
-   change is the piece that has to be written.
+2. Point the marketplace app spec at the new image. New deploys only.
+3. Existing servers need their own spec updated, which only the app owner can
+   sign. The dashboard's "Server update available" flow is the machinery for that,
+   but it only knows how to offer env changes today; offering an image change is
+   the piece that has to be written.

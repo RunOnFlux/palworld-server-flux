@@ -80,9 +80,9 @@ release (`vX.Y.Z` only, never `:latest`/`:dev`) when one appears. Needs
 
 ## Related
 
-- `~/work/palworldwebsitemaster` — the dashboard that configures these servers;
-  `src/config/serverMaintenance.js` holds the env baseline and the
-  "Server update available" flow that is how an existing customer gets a change.
-- `~/work/cloudadminmaster/flux-app-palworld.json` — the marketplace spec (new
-  deploys only).
-- Upstream PR [#931](https://github.com/thijsvanloef/palworld-server-docker/pull/931) — ours, open.
+- Upstream PR [#931](https://github.com/thijsvanloef/palworld-server-docker/pull/931),
+  which this image carries until it merges.
+- The dashboard that configures these servers writes `PalWorldSettings.ini` and the
+  app spec's environment; an env baseline there decides what a customer is offered
+  as a "server update", and it is the only way a change reaches an existing server,
+  since only the app owner can sign a spec update.
