@@ -110,6 +110,17 @@ flux_admin_password() {
 }
 
 # --- REST API ---------------------------------------------------------------
+# Endpoints the game only accepts as POST, even when there is nothing to send.
+# /v1/api/save is the one that matters here and it answers 404 to a GET, which reads
+# exactly like "this server has no save endpoint" rather than "you used the wrong
+# verb" — upstream carries the same list for the same reason.
+flux_rest_is_post() {
+  case "$1" in
+    save|stop|shutdown|announce|kick|ban|unban) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Sets FLUX_REST_BODY and FLUX_REST_CODE, and returns 0 only on a 200.
 #
 # It hands the body back in a global rather than printing it because the status
@@ -122,7 +133,7 @@ flux_rest() {
   FLUX_REST_CODE="000"
   # shellcheck disable=SC2119
   pw="$(flux_admin_password)" || pw=""
-  if [ -n "${data}" ]; then
+  if [ -n "${data}" ] || flux_rest_is_post "${path}"; then
     out=$(curl -sS -m "${FLUX_REST_TIMEOUT}" -u "admin:${pw}" -w $'\n%{http_code}' \
       -X POST --json "${data}" "http://127.0.0.1:${REST_API_PORT:-8212}/v1/api/${path}" 2>/dev/null)
   else

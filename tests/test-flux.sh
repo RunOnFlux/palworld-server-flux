@@ -83,6 +83,19 @@ check "the env var wins" fromEnv "$(ADMIN_PASSWORD=fromEnv flux_admin_password)"
 # shellcheck disable=SC2119
 check "an empty env var falls back to the ini" fromIni "$(ADMIN_PASSWORD='' flux_admin_password)"
 
+echo "flux_rest_is_post"
+# /v1/api/save answers 404 to a GET, which is indistinguishable from a server that
+# does not have the endpoint. Getting this list wrong means the scheduled restart
+# stops saving and nobody notices until someone loses an hour of play.
+for endpoint in save stop shutdown announce kick ban unban; do
+  flux_rest_is_post "${endpoint}"
+  check "${endpoint} is POSTed" 0 "$?"
+done
+for endpoint in info metrics players settings; do
+  flux_rest_is_post "${endpoint}"
+  check "${endpoint} is a GET" 1 "$?"
+done
+
 echo "flux_json_num"
 metrics='{"currentplayernum":2,"serverfps":59,"serverframetime":16.4,"maxplayernum":32,"uptime":749,"days":523}'
 check "reads a field" 59 "$(flux_json_num "${metrics}" serverfps)"
