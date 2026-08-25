@@ -11,9 +11,13 @@ container, the process and every platform health signal looking perfectly fine
 while nobody can play (README, "Why it exists"). Five shell scripts, a Dockerfile,
 two test suites.
 
-The rule that shapes everything here: **nothing inside a container can restart it**.
-Recovery means ending the container so the platform rebuilds it. FluxOS has no
-health-driven restart; it only reacts to a container exiting.
+The rule that shapes everything here: **the container supervises its own server**.
+PID 1 runs upstream's `init.sh` as a child and starts a fresh generation when it
+ends, the same shape as the `lloesche/valheim-server` image we run for Valheim.
+Ending the container is the fallback for a server that will not stay up, because
+the platform path is slower and conditional: FluxOS has no health-driven restart
+at all, it only reacts to a container exiting, and for our `g:` components that
+means the 30 second `masterSlaveApps` loop rather than Docker's restart policy.
 
 ## Commands
 
@@ -31,10 +35,12 @@ release (`vX.Y.Z` only, never `:latest`/`:dev`) when one appears. Needs
 
 ## The files
 
-- `scripts/flux-entrypoint.sh` — PID 1. Exports `ADMIN_PASSWORD` from the ini,
-  starts the guard, runs upstream's `init.sh` **as a child** (never `exec`, so the
-  exit is ours to control), forwards signals to it, and guarantees the container
-  ends within `FLUX_RESTART_GRACE` once a restart is requested. Exit 42 = we meant it.
+- `scripts/flux-entrypoint.sh` — PID 1 and the supervisor. Exports `ADMIN_PASSWORD`
+  from the ini, then loops: start a generation (`setsid ./init.sh` + the guard),
+  wait, sweep the whole process group, start the next one. Never `exec`, so the
+  exit is ours to control. Forwards signals so `docker stop` still reaches
+  upstream's save-on-SIGTERM handler and is never followed by a restart. Exit 42 =
+  we gave up on restarting in place and want the container rebuilt.
 - `scripts/flux-guard.sh` — the probe loop, and `--check` for the HEALTHCHECK.
 - `scripts/flux-reboot.sh` — the scheduled restart. `auto_reboot.sh` is symlinked to
   it, which is the path upstream's `start.sh` bakes into the crontab, so existing app
@@ -57,7 +63,14 @@ release (`vX.Y.Z` only, never `:latest`/`:dev`) when one appears. Needs
   write that emptiness over the last good save. The scheduled reboot saves only
   after confirming fps > 0.
 - **`/tmp` survives a container restart.** The restart marker is cleared on boot;
-  if it were not, the deadline watcher would fire immediately and loop the server.
+  if it were not, the supervisor would read it as a restart nobody asked for.
+- **Never signal your own process group.** `sweep_generation` kills
+  `-${init_pgid}`, which is PID 1's own group if `setsid` did not take. It checks,
+  and falls back to killing named children. Getting this wrong kills the container
+  every time a generation ends.
+- **Every generation gets a fresh guard.** Its state (seen-healthy, previous
+  uptime, strike counts) must not carry across a restart, and a probe that dies
+  silently leaves the server unprotected, so the supervisor restarts it too.
 - Upstream's `start.sh` only writes the reboot crontab when **both**
   `AUTO_REBOOT_ENABLED` and `REST_API_ENABLED` are true. The latter defaults to
   true in the image, and we do not set it — worth remembering before concluding a

@@ -39,6 +39,10 @@ FLUX_GUARD_RXQ_BYTES="${FLUX_GUARD_RXQ_BYTES:-65536}"
 FLUX_GUARD_MIN_UPTIME="${FLUX_GUARD_MIN_UPTIME:-300}"
 # Log the verdict but never act. Use it to watch a fleet before arming it.
 FLUX_GUARD_DRY_RUN="${FLUX_GUARD_DRY_RUN:-false}"
+# Grace between deciding and acting, announced in-game. Costs a minute of downtime
+# on a server that is already down, and buys two things: anyone still connected
+# gets told why, and a server that recovers inside the window is left alone.
+FLUX_GUARD_RESTART_DELAY="${FLUX_GUARD_RESTART_DELAY:-60}"
 
 started_at="$(date -u +%s)"
 prev_uptime=""
@@ -110,6 +114,17 @@ flux_guard_sample() {
   return 0
 }
 
+# What the players are told, per verdict. Deliberately plain: whoever reads it is
+# already staring at a server that does not work.
+flux_guard_message() {
+  case "$1" in
+    stalled)      printf 'This server has stopped responding to network traffic.' ;;
+    unresponsive) printf 'This server has stopped responding.' ;;
+    worldless)    printf 'The world is no longer loaded on this server.' ;;
+    *)            printf 'This server needs to restart.' ;;
+  esac
+}
+
 # --- one-shot mode (docker HEALTHCHECK) -------------------------------------
 if [ "${1:-}" = "--check" ]; then
   FLUX_GUARD_LOG=""   # a health check must not write to the customer's volume
@@ -168,6 +183,21 @@ while true; do
     flux_log "DRY RUN: would restart now (${verdict}: ${evidence})"
     streak[$verdict]=0
     continue
+  fi
+
+  flux_log "ACTION ${verdict} confirmed ${FLUX_GUARD_FAILURES} times (${evidence}); warning players and restarting in ${FLUX_GUARD_RESTART_DELAY}s"
+  flux_restart_countdown "${FLUX_GUARD_RESTART_DELAY}" "$(flux_guard_message "${verdict}")"
+
+  # One last look before pulling the trigger. A server that came back during the
+  # countdown does not need restarting, and this is the cheapest place to find out.
+  if [ "${FLUX_GUARD_RESTART_DELAY}" -gt 0 ]; then
+    flux_guard_sample
+    if [ "${GUARD_VERDICT}" = "ok" ]; then
+      flux_log "restart cancelled: the server recovered during the countdown (${GUARD_EVIDENCE})"
+      flux_announce "The server recovered. No restart needed."
+      for k in "${!streak[@]}"; do streak[$k]=0; done
+      continue
+    fi
   fi
 
   flux_force_restart "${verdict} confirmed ${FLUX_GUARD_FAILURES} times (${evidence})"

@@ -242,10 +242,38 @@ flux_classify() {
   printf 'ok'
 }
 
-# --- forcing the container down ---------------------------------------------
-# The only way a container restarts itself is by ending. Killing the game is what
-# ends it: upstream's start.sh runs PalServer in the foreground, so its exit walks
-# init.sh out and PID 1 (flux-entrypoint.sh) exits behind it.
+# --- warning the players ---------------------------------------------------
+# Best effort by design. In most of the states that get us here there is nobody
+# left to warn: mode B has already dropped every player, and a stalled or
+# unresponsive server cannot be asked to announce anything. It costs one REST
+# call to try, and on the occasions it does land the players learn why their
+# server went away, so failures are ignored rather than reported.
+flux_announce() {
+  flux_rest announce "{\"message\":\"$1\"}" >/dev/null 2>&1 || true
+}
+
+# Counts down to a restart, announcing in-game at 30 and 10 seconds left.
+# $1 seconds, $2 the sentence that explains why.
+flux_restart_countdown() {
+  local remaining="$1" why="$2" next mark
+  [ "${remaining}" -gt 0 ] 2>/dev/null || return 0
+  flux_announce "${why} Restarting in ${remaining} seconds."
+  while [ "${remaining}" -gt 0 ]; do
+    next=0
+    for mark in 30 10; do
+      if [ "${remaining}" -gt "${mark}" ]; then next="${mark}"; break; fi
+    done
+    sleep "$((remaining - next))"
+    remaining="${next}"
+    [ "${remaining}" -gt 0 ] && flux_announce "Restarting in ${remaining} seconds."
+  done
+}
+
+# --- forcing the server down -------------------------------------------------
+# Killing the game is what ends a generation: upstream's start.sh runs PalServer
+# in the foreground, so its exit walks init.sh out and hands control back to the
+# supervisor in flux-entrypoint.sh, which starts a fresh server in place (or ends
+# the container, under FLUX_RESTART_MODE=container).
 #
 # We SIGKILL rather than ask the server to shut down gracefully, and we never ask
 # it to save first. In every state that gets us here the in-memory world is

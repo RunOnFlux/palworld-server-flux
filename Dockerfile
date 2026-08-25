@@ -33,17 +33,29 @@ ENV FLUX_IMAGE_VERSION=${FLUX_IMAGE_VERSION} \
 
 # The probe: on, one sample a minute, three strikes before it believes anything,
 # and no action at all during the first five minutes or before the server has been
-# seen working once. FLUX_GUARD_DRY_RUN=true logs the verdict and never acts.
+# seen working once. Once it decides, it warns the players in game and waits a
+# minute, which also gives a server that is recovering the chance to say so.
+# FLUX_GUARD_DRY_RUN=true logs the verdict and never acts.
 ENV FLUX_GUARD_ENABLED=true \
     FLUX_GUARD_INTERVAL=60 \
     FLUX_GUARD_FAILURES=3 \
     FLUX_GUARD_RXQ_BYTES=65536 \
     FLUX_GUARD_MIN_UPTIME=300 \
+    FLUX_GUARD_RESTART_DELAY=60 \
     FLUX_GUARD_DRY_RUN=false
 
-# How long a requested restart may take before PID 1 stops waiting for a polite
-# exit and ends the container itself.
-ENV FLUX_RESTART_GRACE=60
+# Restarts happen inside the container: PID 1 supervises the server and starts a
+# fresh one in place, without the platform being involved. The platform is the
+# fallback — after MAX_ATTEMPTS restarts inside WINDOW seconds the container ends
+# instead, because a server that cannot stay up needs rebuilding, not restarting.
+# FLUX_RESTART_MODE=container skips straight to ending the container every time.
+# GRACE is how long a requested restart may take before the supervisor stops
+# waiting for a polite exit.
+ENV FLUX_RESTART_MODE=process \
+    FLUX_RESTART_MAX_ATTEMPTS=5 \
+    FLUX_RESTART_WINDOW=3600 \
+    FLUX_RESTART_BACKOFF=10 \
+    FLUX_RESTART_GRACE=60
 
 # Upstream's health check is `pgrep PalServer-Linux`, which is true in both of the
 # states this image exists to catch: the process is always there. Ours asks the

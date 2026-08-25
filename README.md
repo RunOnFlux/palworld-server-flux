@@ -71,6 +71,16 @@ Three things it deliberately will not do:
   emptiness over the customer's last good save. What a kill costs is the interval
   since the last autosave, which was lost the moment the fault happened.
 
+Once it has decided, it does not pull the trigger immediately: it announces the
+restart in game and counts down `FLUX_GUARD_RESTART_DELAY` seconds (60 by
+default), with reminders at 30 and 10 seconds left, and then takes one last
+sample. A server that came back during the countdown is left alone and the
+countdown is called off, out loud. The warning is best effort by design — in most
+of these states there is nobody left to warn, because mode B has already dropped
+every player and a stalled server cannot be asked to announce anything — but it
+costs one REST call to try, and the wait doubles as the last chance for a server
+that is recovering to say so.
+
 `flux-guard.sh --check` runs one sample and exits non-zero when unhealthy. That is
 also the image's `HEALTHCHECK`, replacing `pgrep`, so `docker inspect` finally
 agrees with what the players see. It restarts nothing by itself.
@@ -84,8 +94,8 @@ restart silently does nothing on the nights it is needed.
 
 Ours warns the players, saves **only if the world is still loaded and ticking**,
 asks the server to shut down, and then stops asking: after
-`FLUX_REBOOT_GRACEFUL_WAIT` seconds it kills the process, and PID 1 ends the
-container within `FLUX_RESTART_GRACE` seconds of that. It never silently skips.
+`FLUX_REBOOT_GRACEFUL_WAIT` seconds it kills the process, and the supervisor
+replaces it within `FLUX_RESTART_GRACE` seconds of that. It never silently skips.
 
 `auto_reboot.sh` in this image is a symlink to it, and that is the path upstream's
 `start.sh` writes into the crontab, so **an app spec that already schedules a
@@ -111,28 +121,46 @@ It also makes the `ADMIN_PASSWORD=$(sed ...)` prefix we inject into the cron
 expression from the website unnecessary. Leave it: it sets the same value from the
 same file, and removing it is a spec change for 179 live servers.
 
-## How the container actually restarts
+## How a broken server comes back
 
-Nothing inside a container can restart it. What the guard and the scheduled
-reboot do is *end* it, and the platform brings it back:
+Inside the container, in seconds, with the platform never involved.
+
+PID 1 is `flux-entrypoint.sh` and it is a supervisor, the same shape as the
+`lloesche/valheim-server` image we run for Valheim (supervisord with
+`autorestart=true` on the server program). Upstream's `init.sh` runs as a child in
+its own process group; when the server ends — because the guard killed it, because
+the scheduled restart asked for it, or because it crashed on its own — the whole
+generation is swept, including the leftovers that would otherwise pile up
+(supercronic, player logging, the autopause helpers), and a fresh one is started
+in place. Generations are numbered in the log.
+
+Ending the container is the **fallback**, not the mechanism. After
+`FLUX_RESTART_MAX_ATTEMPTS` in-place restarts inside `FLUX_RESTART_WINDOW`
+seconds, the supervisor stops trying and exits, because a server that cannot stay
+up needs rebuilding or moving, not restarting again. `FLUX_RESTART_MODE=container`
+skips the supervision entirely and ends the container on every restart.
+
+When it does end the container, it exits **42** rather than 0, so a deliberate
+restart is on the record and cannot be read as a clean stop. What happens then is
+the platform's business:
 
 - **live FluxOS (7.3.0)**: our Palworld components carry the `g:` flag
-  (`containerData: g:/palworld/Pal/Saved`), so Docker's own restart policy is
-  `no` and recovery comes from the `masterSlaveApps` loop, a 30 second cycle that
-  starts the container again on the same node — and therefore the same IP and
-  ports — while FDM still points there.
+  (`containerData: g:/palworld/Pal/Saved`), so Docker's own restart policy is `no`
+  and recovery comes from the `masterSlaveApps` loop, a 30 second cycle gated on
+  syncthing health that starts the container again on the same node — and
+  therefore the same IP and ports — while FDM still points there.
 - **FluxOS 8.x**: `appReconciler` restarts on the Docker `die` event under an
   effective `always` policy, with a backoff ladder.
 
-Neither reads the exit code today, so a deliberate restart could just as well exit
-0. It exits **42** anyway: the intent belongs on the record, and the day a policy
-honours exit codes (`on-failure`) a deliberate restart must not look like a clean
-stop.
+Neither reads the exit code today. Depending on that path for every restart is
+exactly what this image avoids: it is slower, it is conditional on things that
+have nothing to do with the game, and it is not ours.
 
-PID 1 is `flux-entrypoint.sh`, which runs upstream's `init.sh` as a child rather
-than replacing it, so every upstream behaviour is untouched — including the
-SIGTERM handler that saves the world when FluxOS stops the container for a
-redeploy. `tests/test-entrypoint.sh` proves that signal still gets through.
+`docker stop` is the one case that is never followed by a restart. The signal is
+forwarded to `init.sh` so upstream's own SIGTERM handler saves the world, the
+supervisor records that it is stopping for good, and the container exits with
+init's own status. That is what a redeploy, a dashboard Stop, and a node shutdown
+all look like, and they must all still work.
 
 ## Configuration
 
@@ -145,8 +173,13 @@ Everything upstream supports works unchanged. On top of it:
 | `FLUX_GUARD_FAILURES` | `3` | consecutive bad samples before acting |
 | `FLUX_GUARD_RXQ_BYTES` | `65536` | UDP receive queue that counts as stalled (a healthy server peaks around 17 KB; the frozen ones sat at 90 to 110 KB) |
 | `FLUX_GUARD_MIN_UPTIME` | `300` | seconds after boot during which nothing is acted on |
+| `FLUX_GUARD_RESTART_DELAY` | `60` | seconds between deciding and acting, announced in game |
 | `FLUX_GUARD_DRY_RUN` | `false` | log the verdict and never act |
-| `FLUX_RESTART_GRACE` | `60` | seconds PID 1 waits for a polite exit before ending the container itself |
+| `FLUX_RESTART_MODE` | `process` | `process` restarts the server inside the container; `container` ends the container and lets the platform rebuild it |
+| `FLUX_RESTART_MAX_ATTEMPTS` | `5` | in-place restarts allowed inside the window before the container ends instead |
+| `FLUX_RESTART_WINDOW` | `3600` | seconds the attempt count looks back over |
+| `FLUX_RESTART_BACKOFF` | `10` | seconds between generations |
+| `FLUX_RESTART_GRACE` | `60` | seconds a requested restart may spend winding down before the supervisor forces it |
 | `FLUX_REBOOT_GRACEFUL_WAIT` | `90` | seconds the scheduled restart waits for the server to shut itself down |
 | `FLUX_GUARD_LOG` | `/palworld/Pal/Saved/flux-guard.log` | persistent log, capped at 2000 lines |
 
@@ -154,8 +187,33 @@ The log is written to the app volume on purpose: it is the only copy that surviv
 the restart it describes, and the customer can read it from the dashboard's file
 browser.
 
-`FLUX_GUARD_DRY_RUN=true` is the way to introduce this to a fleet. It reports what
-it would have done and touches nothing.
+**The defaults are the live ones.** A spec that sets none of these still gets a
+probe that restarts servers automatically: the values above are baked into the
+image, not into the app spec. `FLUX_GUARD_DRY_RUN=true` is the way to introduce
+this to a fleet first — it reports what it would have done and touches nothing —
+and `FLUX_GUARD_ENABLED=false` switches the probe off entirely, which it says in
+the log rather than doing silently.
+
+Everything the probe does is written both to the container's stdout (so it is in
+`docker logs`, and in the dashboard's console tab) and to the persistent log. The
+lines are not filtered by upstream's `LOG_FILTER_ENABLED` pipeline: the probe is a
+child of PID 1, not of `init.sh`, so its output goes straight out. A full recovery
+reads like this:
+
+```
+[flux] starting the server (generation 1)
+[flux] guard armed: every 60s, 3 strikes, rxq limit 65536 bytes, min uptime 300s, dry_run=false
+[flux] server healthy for the first time this boot (rest=200 metrics=1 fps=59 uptime=600 ...)
+[flux] worldless 1/3 (rest=200 metrics=1 fps=0 uptime=12 prev_uptime=600 rxq=0 save=1 pid=26)
+[flux] worldless 2/3 (...)
+[flux] worldless 3/3 (...)
+[flux] ACTION worldless confirmed 3 times (...); warning players and restarting in 60s
+[flux] RESTART requested: worldless confirmed 3 times (...)
+[flux] sending SIGKILL to PalServer-Linux-Shipping (pid 26)
+[flux] worldless confirmed 3 times (...) — restarting the server in place (1/5 within 3600s), in 10s
+[flux] starting the server (generation 2)
+[flux] server healthy for the first time this boot (rest=200 metrics=1 fps=59 ...)
+```
 
 ## Build and test
 
@@ -169,8 +227,11 @@ docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable -x scripts/*.s
 `tests/test-entrypoint.sh` stands a fake Palworld in front of the guard — a
 process with the right name and the two REST endpoints served from a file — and
 then makes the world disappear underneath it, which is the mode B signature from
-the ticket. It asserts the container ends with exit 42 and says why. No five
-gigabyte download involved.
+the ticket. It asserts that the players are warned, that the server is replaced in
+place, that the container never ended, and that the replacement comes up healthy;
+plus that a server which recovers mid-countdown is spared, that `docker stop` is
+never followed by a restart, and that a server which will not stay up stops being
+restarted. No five gigabyte download involved.
 
 ## Releases
 
