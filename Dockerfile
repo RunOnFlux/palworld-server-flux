@@ -19,6 +19,12 @@ ARG FLUX_IMAGE_VERSION=dev
 
 COPY scripts/flux-lib.sh scripts/flux-guard.sh scripts/flux-reboot.sh scripts/flux-entrypoint.sh /home/steam/server/
 
+# The game's own sample settings file, used only to build the very first
+# PalWorldSettings.ini on a brand new server — at that point the install has not
+# run yet, so the game's copy is not on disk. From the second boot onward the
+# game's own file is preferred, so this going stale costs nothing.
+COPY scripts/PalWorldSettings.default.ini /home/steam/server/PalWorldSettings.default.ini
+
 # auto_reboot.sh is the path upstream's start.sh writes into the crontab. Pointing
 # it at ours means an app spec that already schedules a nightly restart picks up
 # the new behaviour with no change to the spec at all.
@@ -26,6 +32,7 @@ RUN chmod 0755 /home/steam/server/flux-lib.sh \
                 /home/steam/server/flux-guard.sh \
                 /home/steam/server/flux-reboot.sh \
                 /home/steam/server/flux-entrypoint.sh && \
+    chmod 0644 /home/steam/server/PalWorldSettings.default.ini && \
     ln -sf /home/steam/server/flux-reboot.sh /home/steam/server/auto_reboot.sh
 
 ENV FLUX_IMAGE_VERSION=${FLUX_IMAGE_VERSION} \

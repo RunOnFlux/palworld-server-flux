@@ -139,6 +139,21 @@ wait_for() {
   return 1
 }
 
+echo "a brand new server with no settings file"
+if run_stub linger; then
+  ini=/palworld/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
+  check "it is given one before the game starts" 0 \
+    "$(docker exec "${CONTAINER}" test -s "${ini}"; echo $?)"
+  check "with the REST API on" True \
+    "$(docker exec "${CONTAINER}" grep -o 'RESTAPIEnabled=[^,)]*' "${ini}" | cut -d= -f2 | tr -d '\r\n')"
+  check "with a 60 second autosave" 60.000000 \
+    "$(docker exec "${CONTAINER}" grep -o 'AutoSaveSpan=[^,)]*' "${ini}" | cut -d= -f2 | tr -d '\r\n')"
+  check "with an admin password" 24 \
+    "$(docker exec "${CONTAINER}" grep -o 'AdminPassword="[^"]*"' "${ini}" | sed 's/.*="//;s/"//' | tr -d '\r\n' | wc -c)"
+  check "and the password is picked up for the container's own calls" yes \
+    "$(saw 'using AdminPassword from')"
+fi
+
 echo "a restart requested from inside, with a server that will not go quietly"
 if run_stub ignore; then
   docker exec "${CONTAINER}" touch /tmp/flux-restart-requested

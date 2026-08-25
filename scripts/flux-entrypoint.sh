@@ -101,6 +101,12 @@ resolve_admin_password() {
 
 start_generation() {
   generation=$((generation + 1))
+
+  # Before anything reads it: a server with no settings file gets one, with the
+  # REST API on and an admin password, which is what everything else here depends
+  # on. Done per generation rather than once, so a server that somehow lost its
+  # settings gets them back on the next restart instead of staying unreachable.
+  flux_seed_ini_if_missing
   resolve_admin_password
 
   # The marker means "the generation running right now has been asked to stop", so a

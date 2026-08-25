@@ -83,6 +83,42 @@ check "the env var wins" fromEnv "$(ADMIN_PASSWORD=fromEnv flux_admin_password)"
 # shellcheck disable=SC2119
 check "an empty env var falls back to the ini" fromIni "$(ADMIN_PASSWORD='' flux_admin_password)"
 
+echo "seeding a new server's settings"
+FLUX_DEFAULT_INI="${repo_root}/scripts/PalWorldSettings.default.ini"
+seed_dir="${tmp}/seed"
+mkdir -p "${seed_dir}"
+
+# The state a brand new server is actually left in: the file exists and is empty,
+# because the engine rewrote the game's all-defaults sample as nothing.
+printf '\n' >"${seed_dir}/empty.ini"
+: >"${seed_dir}/zero.ini"
+check "an empty file is not populated" 1 "$(flux_ini_is_populated "${seed_dir}/empty.ini"; echo $?)"
+check "a zero-byte file is not populated" 1 "$(flux_ini_is_populated "${seed_dir}/zero.ini"; echo $?)"
+check "a missing file is not populated" 1 "$(flux_ini_is_populated "${seed_dir}/nope.ini"; echo $?)"
+check "the game's sample is populated" 0 "$(flux_ini_is_populated "${FLUX_DEFAULT_INI}"; echo $?)"
+
+seeded="$(flux_ini_seed <"${FLUX_DEFAULT_INI}")"
+check "the REST API is on" True "$(printf '%s' "${seeded}" | grep -o 'RESTAPIEnabled=[^,)]*' | cut -d= -f2)"
+check "the autosave is 60" 60.000000 "$(printf '%s' "${seeded}" | grep -o 'AutoSaveSpan=[^,)]*' | cut -d= -f2)"
+check "the admin password is 24 characters" 24 "$(printf '%s' "${seeded}" | grep -o 'AdminPassword="[^"]*"' | sed 's/.*="//;s/"//' | tr -d '\n' | wc -c)"
+check "the password has no look-alike characters" "" "$(printf '%s' "${seeded}" | grep -o 'AdminPassword="[^"]*"' | sed 's/.*="//;s/"//' | tr -d 'a-km-zA-HJ-NP-Z2-9')"
+check "every other setting is carried over" \
+  "$(grep -c '=' "${FLUX_DEFAULT_INI}")" "$(printf '%s\n' "${seeded}" | grep -c '=')"
+check "two seeds do not share a password" different \
+  "$([ "$(flux_generate_password)" = "$(flux_generate_password)" ] && echo same || echo different)"
+
+# Seeding a file that already has settings would be overwriting the customer.
+cp "${FLUX_DEFAULT_INI}" "${seed_dir}/mine.ini"
+sed -i 's/AutoSaveSpan=[^,)]*/AutoSaveSpan=15.000000/' "${seed_dir}/mine.ini"
+before="$(cat "${seed_dir}/mine.ini")"
+FLUX_SETTINGS_INI="${seed_dir}/mine.ini" flux_seed_ini_if_missing >/dev/null
+check "a populated file is left exactly as it was" "${before}" "$(cat "${seed_dir}/mine.ini")"
+
+# And the empty one is replaced.
+FLUX_SETTINGS_INI="${seed_dir}/empty.ini" FLUX_GAME_DEFAULT_INI="${seed_dir}/nope.ini" flux_seed_ini_if_missing >/dev/null
+check "an empty file is replaced" 0 "$(flux_ini_is_populated "${seed_dir}/empty.ini"; echo $?)"
+check "and comes out with the REST API on" True "$(grep -o 'RESTAPIEnabled=[^,)]*' "${seed_dir}/empty.ini" | cut -d= -f2)"
+
 echo "flux_rest_is_post"
 # /v1/api/save answers 404 to a GET, which is indistinguishable from a server that
 # does not have the endpoint. Getting this list wrong means the scheduled restart

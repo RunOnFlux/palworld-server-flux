@@ -256,6 +256,96 @@ flux_classify() {
   printf 'ok'
 }
 
+# --- seeding a brand new server's settings file ----------------------------
+# A fresh Palworld server ends up with an EMPTY PalWorldSettings.ini. Upstream's
+# start.sh copies the game's DefaultPalWorldSettings.ini into place, but that file
+# is a sample in which every value equals the game's default, so the engine writes
+# it straight back out as nothing. What is left is a one-byte file, and from then
+# on: REST is off, so the scheduled restart cannot authenticate, the health probe
+# can never see the server working, and the dashboard's own reconcile refuses to
+# touch a file with no OptionSettings line to patch. Nothing recovers on its own.
+#
+# So the server is given a settings file before the game ever starts, holding the
+# three values a server we run needs and the game's sample does not provide. They
+# are all non-default, which is also what makes the file survive: the engine keeps
+# what differs from its defaults.
+#
+# Only ever written when there is no OptionSettings line to lose — a populated file
+# belongs to the customer and is never touched here. The game's own sample is
+# preferred as the base whenever it exists (it does from the second boot onward,
+# and it carries whatever settings the current game version added); the copy baked
+# into this image is the fallback for the very first boot, before the install has
+# put the game's own file on disk.
+FLUX_DEFAULT_INI="${FLUX_DEFAULT_INI:-/home/steam/server/PalWorldSettings.default.ini}"
+FLUX_GAME_DEFAULT_INI="${FLUX_GAME_DEFAULT_INI:-/palworld/DefaultPalWorldSettings.ini}"
+FLUX_SEED_AUTOSAVE_SPAN="${FLUX_SEED_AUTOSAVE_SPAN:-60.000000}"
+
+# 24 characters, no look-alikes, from the kernel. Matches what the dashboard
+# generates, so a password seeded here and one seeded there are indistinguishable.
+flux_generate_password() {
+  LC_ALL=C tr -dc 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789' </dev/urandom | head -c 24
+}
+
+# True when the file holds a settings line worth keeping.
+flux_ini_is_populated() {
+  [ -s "$1" ] && grep -q 'OptionSettings=(' "$1" 2>/dev/null
+}
+
+# Sets one key inside the single OptionSettings=(...) line, replacing it in place
+# when it is already there and inserting it at the front when it is not. Values are
+# matched up to the next , or ) so a key that is present but malformed is still
+# recognised as present — matching narrowly would insert a duplicate.
+flux_ini_set() {
+  local ini="$1" key="$2" value="$3"
+  if printf '%s' "${ini}" | grep -q "${key}=[^,)]*"; then
+    printf '%s' "${ini}" | sed "s/${key}=[^,)]*/${key}=${value}/"
+  else
+    printf '%s' "${ini}" | sed "s/OptionSettings=(/OptionSettings=(${key}=${value},/"
+  fi
+}
+
+# The settings file a server we run should start life with. Reads a base ini on
+# stdin, prints the seeded one.
+flux_ini_seed() {
+  local ini password
+  ini="$(cat)"
+  password="$(flux_generate_password)"
+  ini="$(flux_ini_set "${ini}" RESTAPIEnabled True)"
+  ini="$(flux_ini_set "${ini}" AutoSaveSpan "${FLUX_SEED_AUTOSAVE_SPAN}")"
+  flux_ini_set "${ini}" AdminPassword "\"${password}\""
+}
+
+# Writes it, once, for a server that has none. Never returns non-zero: a server
+# that cannot be seeded still boots, it just boots the way it used to.
+flux_seed_ini_if_missing() {
+  local dir base tmp
+  dir="$(dirname "${FLUX_SETTINGS_INI}")"
+
+  if flux_ini_is_populated "${FLUX_SETTINGS_INI}"; then
+    return 0
+  fi
+
+  if [ -r "${FLUX_GAME_DEFAULT_INI}" ]; then
+    base="${FLUX_GAME_DEFAULT_INI}"
+  elif [ -r "${FLUX_DEFAULT_INI}" ]; then
+    base="${FLUX_DEFAULT_INI}"
+  else
+    flux_log "WARN no settings file and no template to build one from; the server will boot with the game's defaults and no REST API"
+    return 0
+  fi
+
+  mkdir -p "${dir}" 2>/dev/null
+  tmp="${FLUX_SETTINGS_INI}.flux-seed"
+  if flux_ini_seed <"${base}" >"${tmp}" 2>/dev/null && [ -s "${tmp}" ] && mv "${tmp}" "${FLUX_SETTINGS_INI}" 2>/dev/null; then
+    chown "${PUID:-1000}:${PGID:-1000}" "${FLUX_SETTINGS_INI}" 2>/dev/null
+    flux_log "no server settings found: wrote a fresh PalWorldSettings.ini from $(basename "${base}") with the REST API on, a random admin password, and a ${FLUX_SEED_AUTOSAVE_SPAN%%.*}s autosave"
+  else
+    rm -f "${tmp}" 2>/dev/null
+    flux_log "WARN could not write ${FLUX_SETTINGS_INI}; the server will boot with the game's defaults and no REST API"
+  fi
+  return 0
+}
+
 # --- warning the players ---------------------------------------------------
 # Best effort by design. In most of the states that get us here there is nobody
 # left to warn: mode B has already dropped every player, and a stalled or

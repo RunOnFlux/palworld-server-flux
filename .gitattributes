@@ -1,0 +1,4 @@
+# The game writes this file with CRLF endings. Ship it exactly as the game does:
+# a checkout that silently rewrites it would put a file the game never produced
+# into the image.
+scripts/PalWorldSettings.default.ini -text
