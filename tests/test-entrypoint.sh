@@ -33,7 +33,18 @@ check() {
   fi
 }
 logs() { docker logs "${CONTAINER}" 2>&1; }
-saw() { logs | grep -qF "$1" && echo yes || echo no; }
+
+# A single `docker logs` read can come back short while the container is busy, and
+# a line that is genuinely there then reads as missing — which looks like a broken
+# feature rather than a busy machine. Retry briefly before concluding it is absent;
+# a line that never arrives still fails, just five seconds later.
+saw() {
+  for _ in $(seq 1 5); do
+    logs | grep -qF "$1" && { echo yes; return; }
+    sleep 1
+  done
+  echo no
+}
 
 cat >"${tmp}/init.sh" <<'STUB'
 #!/bin/bash
@@ -78,10 +89,24 @@ esac
 STUB
 chmod 0755 "${tmp}/init.sh"
 
+# `docker rm -f` returns before the name is actually free, so the next `docker run`
+# can lose the race and fail with a name conflict. Everything after that reads the
+# OLD container's logs, which shows up as an unrelated assertion failing.
+remove_container() {
+  docker rm -f "${CONTAINER}" >/dev/null 2>&1
+  for _ in $(seq 1 30); do
+    docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER}" || return 0
+    sleep 1
+  done
+  echo "  FAIL could not remove the previous test container"
+  failures=$((failures + 1))
+  return 1
+}
+
 # run_stub <mode> [-e VAR=value ...]
 run_stub() {
   local mode="$1"; shift
-  docker rm -f "${CONTAINER}" >/dev/null 2>&1
+  remove_container || return 1
   docker run -d --name "${CONTAINER}" \
     -e STUB_MODE="${mode}" \
     -e FLUX_RESTART_GRACE=5 \
@@ -100,21 +125,35 @@ run_stub() {
 }
 
 # wait_for <text> <seconds>
+# A timeout is reported as its own failure. Without that, every assertion that
+# followed failed instead, which reads like a broken feature rather than a busy
+# machine — and these containers do get slow when something else is saturating the
+# disk.
 wait_for() {
   for _ in $(seq 1 "$2"); do
     logs | grep -qF "$1" && return 0
     sleep 1
   done
+  printf '  FAIL timed out after %ss waiting for: %s\n' "$2" "$1"
+  failures=$((failures + 1))
   return 1
 }
 
 echo "a restart requested from inside, with a server that will not go quietly"
 if run_stub ignore; then
   docker exec "${CONTAINER}" touch /tmp/flux-restart-requested
-  wait_for "starting the server (generation 2)" 30
+  wait_for "starting the server (generation 2)" 60
   check "the wedged generation is forced down" yes "$(saw 'still winding down; forcing this generation to end')"
   check "a fresh server is started in place" yes "$(saw 'starting the server (generation 2)')"
   check "the container never ended" true "$(docker inspect -f '{{.State.Running}}' ${CONTAINER})"
+  # A marker that outlives the generation it belonged to killed a healthy server on a
+  # real box: a scheduled restart fired in the gap between two generations, found
+  # nothing to stop, and left the request behind for the next one to obey.
+  check "the request does not outlive the generation" 1 \
+    "$(docker exec ${CONTAINER} test -f /tmp/flux-restart-requested; echo $?)"
+  sleep 12   # longer than FLUX_RESTART_GRACE: a stale marker would fire by now
+  check "and the fresh generation is left alone" 0 \
+    "$(logs | grep -c 'starting the server (generation 3)')"
 fi
 
 echo "docker stop"
@@ -146,7 +185,7 @@ if run_stub server -e FLUX_GUARD_FAILURES=2 -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_G
   # The signature from the incident: same process, uptime restarted from zero, no
   # world behind the API.
   docker exec "${CONTAINER}" sh -c 'printf "{\"serverfps\":0,\"currentplayernum\":0,\"uptime\":12,\"days\":0}" > /tmp/metrics.json'
-  wait_for "starting the server (generation 2)" 40
+  wait_for "starting the server (generation 2)" 60
   check "the world loss is detected" yes "$(saw 'worldless 2/2 (rest=200 metrics=1 fps=0')"
   check "players are warned before anything happens" yes "$(saw 'warning players and restarting in 4s')"
   check "the server is killed" yes "$(saw 'sending SIGKILL to PalServer-Linux-Shipping')"
@@ -164,7 +203,7 @@ if run_stub server -e FLUX_GUARD_FAILURES=2 -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_G
   wait_for "restart cancelled" 40
   check "the restart is called off" yes "$(saw 'restart cancelled: the server recovered')"
   check "and nothing was killed" no "$(saw 'sending SIGKILL')"
-  docker rm -f "${CONTAINER}" >/dev/null 2>&1
+  remove_container
 fi
 
 if [ "${failures}" -eq 0 ]; then

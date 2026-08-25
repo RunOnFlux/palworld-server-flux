@@ -78,6 +78,14 @@ main() {
     exit 0
   fi
 
+  # Nothing to stop: the supervisor is already dealing with whatever happened, and
+  # asking for a restart of a server that is not running would leave a marker behind
+  # for the NEXT generation to trip over.
+  if [ -z "$(flux_game_pid)" ]; then
+    flux_log "no server process running; leaving this to the supervisor"
+    exit 0
+  fi
+
   # From here on the container WILL go down. The marker goes in first so that
   # however the process ends — polite shutdown, SIGKILL, or the server dying on
   # its own halfway through — PID 1 knows this was on purpose.

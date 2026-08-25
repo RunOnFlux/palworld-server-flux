@@ -102,6 +102,14 @@ resolve_admin_password() {
 start_generation() {
   generation=$((generation + 1))
   resolve_admin_password
+
+  # The marker means "the generation running right now has been asked to stop", so a
+  # generation always starts without one. Without this line a marker written in the
+  # gap between generations — a cron reboot that fires while the server is already
+  # down, two restarts overlapping — survives into the next generation, and the
+  # deadline watcher below kills a perfectly healthy server sixty seconds after it
+  # came up. Seen happening on a real server.
+  rm -f "${FLUX_RESTART_MARKER}"
   flux_log "starting the server (generation ${generation})"
 
   # Its own process group, so a generation can be swept whole. Without it, a
