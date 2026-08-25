@@ -51,16 +51,12 @@ fi
 
 flux_log "flux-entrypoint starting (image ${FLUX_IMAGE_VERSION:-unknown}, base ${FLUX_BASE_VERSION:-unknown}, restart mode ${FLUX_RESTART_MODE})"
 
-if [ -z "${ADMIN_PASSWORD:-}" ]; then
-  if ADMIN_PASSWORD="$(flux_admin_password_from_ini)"; then
-    export ADMIN_PASSWORD
-    flux_log "ADMIN_PASSWORD was empty; using AdminPassword from ${FLUX_SETTINGS_INI} for the container's own REST calls"
-  else
-    flux_log "WARN no admin password in the environment or in ${FLUX_SETTINGS_INI}; the container's REST calls will be unauthorized until one is set"
-  fi
-fi
-
 cd /home/steam/server || exit 1
+
+# Whether the operator supplied one. If they did, it wins for the life of the
+# container and the ini is never consulted — same precedence as upstream PR #931.
+admin_password_from_env=0
+[ -n "${ADMIN_PASSWORD:-}" ] && admin_password_from_env=1
 
 init_pid=""
 init_pgid=""
@@ -78,8 +74,34 @@ term_handler() {
 }
 trap term_handler TERM INT
 
+# Upstream authenticates all of its container-side REST calls (the graceful save
+# on SIGTERM, backups, rcon.yaml) as admin:${ADMIN_PASSWORD} — the env var, which
+# is empty on every server we sell, because DISABLE_GENERATE_SETTINGS=true means
+# the customer's password lives in PalWorldSettings.ini instead. Filling it in
+# here fixes every one of those paths at once, which is what our upstream PR #931
+# does inside the image; doing it in the wrapper means it holds on any base
+# version, and becomes a harmless no-op the day the PR merges.
+#
+# Re-read once per generation rather than once per container: a password changed
+# from the dashboard then takes effect at the next restart instead of never.
+resolve_admin_password() {
+  local resolved=""
+  [ "${admin_password_from_env}" = "1" ] && return 0
+  resolved="$(flux_admin_password_from_ini)" || resolved=""
+  if [ "${resolved}" != "${ADMIN_PASSWORD:-}" ]; then
+    if [ -n "${resolved}" ]; then
+      flux_log "ADMIN_PASSWORD is not set; using AdminPassword from ${FLUX_SETTINGS_INI} for the container's own REST calls"
+    else
+      flux_log "WARN no admin password in the environment or in ${FLUX_SETTINGS_INI}; the container's REST calls will be unauthorized until one is set"
+    fi
+  fi
+  ADMIN_PASSWORD="${resolved}"
+  export ADMIN_PASSWORD
+}
+
 start_generation() {
   generation=$((generation + 1))
+  resolve_admin_password
   flux_log "starting the server (generation ${generation})"
 
   # Its own process group, so a generation can be swept whole. Without it, a

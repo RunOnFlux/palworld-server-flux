@@ -110,12 +110,28 @@ edits survive a reboot, which means the password the customer sets lands in
 a 401: the nightly restart, the backups, and the graceful save on `docker stop`.
 
 [PR #931](https://github.com/thijsvanloef/palworld-server-docker/pull/931) is ours
-and still open. Rather than vendor a patch that would go stale against every new
-base image, `flux-entrypoint.sh` reads the ini and exports `ADMIN_PASSWORD` before
-handing over to upstream's `init.sh`, which fixes upstream's own code paths on
-whatever base version we happen to be pinned to. `ADMIN_PASSWORD` still wins
-whenever it is set, so nothing changes for a setup that already works. When the PR
-merges this becomes redundant and harmless.
+and still open, so this image carries the fix itself. Not as a vendored patch —
+that would go stale against every new base image and turn an upstream release into
+a failed build — but as the same behaviour one level up: `flux-entrypoint.sh`
+resolves the password and exports `ADMIN_PASSWORD` before handing over to
+upstream's `init.sh`, so every upstream path that authenticates with that variable
+starts working, on whatever base version we happen to be pinned to. The PR's ini
+parser is ported verbatim into `flux_admin_password_from_ini`, and so are its test
+cases (`tests/test-flux.sh`). `ADMIN_PASSWORD` still wins whenever it is set, so
+nothing changes for a setup that already works, and the day the PR merges this
+becomes a harmless no-op.
+
+Two deliberate differences from the PR:
+
+- It is resolved **once per generation** rather than on every REST call. A
+  password changed from the dashboard therefore takes effect at the next restart
+  rather than immediately. Our own scripts read it fresh every time, so only
+  upstream's paths are affected.
+- The PR also makes `start.sh` write `rcon.yaml` as a YAML single-quoted scalar,
+  so a password holding a quote or a backslash cannot break the file. That half is
+  **not** covered here: it lives inside a file we do not patch. It only bites with
+  `RCON_ENABLED=true` (off by default, and deprecated upstream) and a password with
+  those characters in it.
 
 It also makes the `ADMIN_PASSWORD=$(sed ...)` prefix we inject into the cron
 expression from the website unnecessary. Leave it: it sets the same value from the
