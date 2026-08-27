@@ -52,7 +52,7 @@ before it believes it. The full decision table is unit tested in
 | --- | --- |
 | `stalled` | the game's UDP receive queue is at or above `FLUX_GUARD_RXQ_BYTES` (mode A, the socket half) |
 | `unresponsive` | `/v1/api/info` stopped answering (mode A, the API half) |
-| `worldless` | the API answers but `/v1/api/metrics` does not, or reports 0 fps, or its uptime counter went **backwards**, or the world save vanished from disk (mode B) |
+| `worldless` | the API answers but `/v1/api/metrics` does not, or answers without a readable `serverfps`, or reports 0 fps, or its uptime counter went **backwards**, or the world save vanished from disk (mode B) |
 | `ok` | none of the above |
 
 Three things it deliberately will not do:
@@ -193,6 +193,7 @@ Everything upstream supports works unchanged. On top of it:
 | `FLUX_GUARD_RXQ_BYTES` | `65536` | UDP receive queue that counts as stalled (a healthy server peaks around 17 KB; the frozen ones sat at 90 to 110 KB) |
 | `FLUX_GUARD_MIN_UPTIME` | `300` | seconds after boot during which nothing is acted on |
 | `FLUX_GUARD_RESTART_DELAY` | `60` | seconds between deciding and acting, announced in game |
+| `FLUX_GUARD_BODY_CHARS` | `240` | how much of the metrics body to quote in the log on the first bad sample |
 | `FLUX_GUARD_DRY_RUN` | `false` | log the verdict and never act |
 | `FLUX_RESTART_MODE` | `process` | `process` restarts the server inside the container; `container` ends the container and lets the platform rebuild it |
 | `FLUX_RESTART_MAX_ATTEMPTS` | `5` | in-place restarts allowed inside the window before the container ends instead |
@@ -223,7 +224,8 @@ reads like this:
 [flux] starting the server (generation 1)
 [flux] guard armed: every 60s, 3 strikes, rxq limit 65536 bytes, min uptime 300s, dry_run=false
 [flux] server healthy for the first time this boot (rest=200 metrics=1 fps=59 uptime=600 ...)
-[flux] worldless 1/3 (rest=200 metrics=1 fps=0 uptime=12 prev_uptime=600 rxq=0 save=1 pid=26)
+[flux] worldless 1/3 (rest=200 metrics=1 fps=unreadable players=- uptime=12 prev_uptime=600 rxq=0 save=1 pid=26)
+[flux]   metrics said: <the first 240 characters of whatever the server replied>
 [flux] worldless 2/3 (...)
 [flux] worldless 3/3 (...)
 [flux] ACTION worldless confirmed 3 times (...); warning players and restarting in 60s

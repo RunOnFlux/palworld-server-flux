@@ -50,6 +50,7 @@ if [ -d "$(dirname "${FLUX_GUARD_LOG}")" ]; then
 fi
 
 flux_log "flux-entrypoint starting (image ${FLUX_IMAGE_VERSION:-unknown}, base ${FLUX_BASE_VERSION:-unknown}, restart mode ${FLUX_RESTART_MODE})"
+flux_log "$(flux_crash_dump_count) crash dump(s) on the volume from previous lives of this world"
 
 cd /home/steam/server || exit 1
 
@@ -63,6 +64,7 @@ init_pgid=""
 guard_pid=""
 terminating=0
 generation=0
+crash_dumps=0
 own_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
 declare -a restart_history=()
 
@@ -100,7 +102,12 @@ resolve_admin_password() {
 }
 
 start_generation() {
+  local before="${crash_dumps}"
   generation=$((generation + 1))
+  crash_dumps="$(flux_crash_dump_count)"
+  if [ "${generation}" -gt 1 ] && [ "${crash_dumps}" -gt "${before}" ]; then
+    flux_log "the game left $(( crash_dumps - before )) new crash dump(s) in ${FLUX_CRASH_DIR} since the last generation"
+  fi
 
   # Before anything reads it: a server with no settings file gets one, with the
   # REST API on and an admin password, which is what everything else here depends
@@ -152,9 +159,26 @@ sweep_generation() {
 # keeps the guard alive for as long as the server is: a probe that died silently
 # is a server with no protection at all.
 wait_for_generation() {
-  local rc marker_seen=0 now
+  local rc marker_seen=0 now phase last_phase=""
+  # Stops the moment the server process exists: from there the guard owns the
+  # story, and this loop goes back to costing nothing.
+  local watch_boot=1
   while kill -0 "${init_pid}" 2>/dev/null; do
     sleep 1
+
+    # One line per transition, never per tick. This is the only thing the
+    # dashboard has to parse to tell a nine minute install from a server that is
+    # about to accept players.
+    if [ "${watch_boot}" = "1" ]; then
+      phase="$(flux_boot_phase \
+        "$(flux_game_installed && printf 1 || printf 0)" \
+        "$([ -n "$(flux_game_pid)" ] && printf 1 || printf 0)")"
+      if [ "${phase}" != "${last_phase}" ]; then
+        last_phase="${phase}"
+        flux_log "phase=${phase}"
+        [ "${phase}" = "loading" ] && watch_boot=0
+      fi
+    fi
 
     # A restart that was asked for has a deadline. Upstream's exit path waits on
     # child processes (backup, restore, player logging) and a wedged one would

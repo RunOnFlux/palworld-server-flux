@@ -14,8 +14,12 @@
 #
 # Neither recovers on its own and only a restart clears them. This loop samples
 # the server once a minute, needs the same verdict FLUX_GUARD_FAILURES times in a
-# row before it believes it, and then ends the container so the platform brings it
-# back (see flux-entrypoint.sh for who does the bringing back).
+# row before it believes it, and then kills the game process. What happens next is
+# flux-entrypoint.sh's call, not ours: under the default FLUX_RESTART_MODE=process
+# it sweeps the generation and starts a fresh one inside the same container, in
+# about thirty seconds and without re-downloading anything. The container only
+# ends once that has been tried FLUX_RESTART_MAX_ATTEMPTS times in an hour, or
+# under FLUX_RESTART_MODE=container.
 #
 # Started in the background by flux-entrypoint.sh. Also usable as a one-shot:
 #   flux-guard.sh --check   prints the verdict, exits 0 when healthy
@@ -43,6 +47,9 @@ FLUX_GUARD_DRY_RUN="${FLUX_GUARD_DRY_RUN:-false}"
 # on a server that is already down, and buys two things: anyone still connected
 # gets told why, and a server that recovers inside the window is left alone.
 FLUX_GUARD_RESTART_DELAY="${FLUX_GUARD_RESTART_DELAY:-60}"
+# How much of the metrics body to keep for the log line on a bad sample. Enough
+# for the whole document a healthy server sends; short enough not to matter.
+FLUX_GUARD_BODY_CHARS="${FLUX_GUARD_BODY_CHARS:-240}"
 
 started_at="$(date -u +%s)"
 prev_uptime=""
@@ -52,6 +59,7 @@ auth_ok=1
 auth_warned_at=0
 GUARD_VERDICT="ok"
 GUARD_EVIDENCE=""
+GUARD_BODY=""
 declare -A streak=([stalled]=0 [unresponsive]=0 [worldless]=0)
 
 # Collects one sample. Sets GUARD_VERDICT and GUARD_EVIDENCE, and updates the
@@ -60,7 +68,8 @@ declare -A streak=([stalled]=0 [unresponsive]=0 [worldless]=0)
 # every cycle, and the guard would lose the one signal — a uptime counter that
 # went backwards — that can only be seen by comparing two samples.
 flux_guard_sample() {
-  local metrics info_ok=0 metrics_ok=0 fps="" uptime="" rxq save_present code now
+  local metrics info_ok=0 metrics_ok=0 fps="" uptime="" players="" rxq save_present code now
+  local fps_rc=0
 
   # Metrics first, and on a healthy server that is the only call made. The game
   # writes a line to its own console for REST activity, and this loop runs for
@@ -73,8 +82,12 @@ flux_guard_sample() {
   code="${FLUX_REST_CODE}"
   if [ "${metrics_ok}" = "1" ]; then
     info_ok=1
-    fps="$(flux_json_num "${metrics}" serverfps)" || fps=""
+    fps="$(flux_json_num "${metrics}" serverfps)" || fps_rc=$?
+    [ "${fps_rc}" = "0" ] || fps=""
     uptime="$(flux_json_num "${metrics}" uptime)" || uptime=""
+    # Free: it rides along in the body we already asked for, and it is the field
+    # that turns "the world died" into "the world died and nobody was on it".
+    players="$(flux_json_num "${metrics}" currentplayernum)" || players=""
   elif [ "${code}" != "401" ] && [ "${code}" != "403" ]; then
     flux_rest info && info_ok=1
     code="${FLUX_REST_CODE}"
@@ -106,9 +119,24 @@ flux_guard_sample() {
 
   GUARD_VERDICT="$(flux_classify "${auth_ok}" "${info_ok}" "${metrics_ok}" "${fps}" \
     "${uptime}" "${prev_uptime}" "${rxq}" "${FLUX_GUARD_RXQ_BYTES}" "${save_present}")"
-  GUARD_EVIDENCE="$(printf 'rest=%s metrics=%s fps=%s uptime=%s prev_uptime=%s rxq=%s save=%s pid=%s' \
-    "${code}" "${metrics_ok}" "${fps:--}" "${uptime:--}" \
+  # fps=- is ambiguous on its own and the ambiguity cost us months: "no such
+  # field" and "the field is there and says nan" are different bugs. rc 2 is the
+  # second one.
+  local fps_shown="${fps:--}"
+  [ -z "${fps}" ] && [ "${fps_rc}" = "2" ] && fps_shown="unreadable"
+
+  GUARD_EVIDENCE="$(printf 'rest=%s metrics=%s fps=%s players=%s uptime=%s prev_uptime=%s rxq=%s save=%s pid=%s' \
+    "${code}" "${metrics_ok}" "${fps_shown}" "${players:--}" "${uptime:--}" \
     "${prev_uptime:--}" "${rxq}" "${save_present}" "$(flux_game_pid)")"
+
+  # Kept for the caller to log when it does not like the verdict. Without it a
+  # strike says "fps=-" and nothing else, and there is no way after the fact to
+  # tell what the server actually replied — which is exactly the hole that hid
+  # this failure. Newlines flattened so one strike stays one line.
+  GUARD_BODY=""
+  if [ "${metrics_ok}" = "1" ] && [ -n "${metrics}" ]; then
+    GUARD_BODY="$(printf '%s' "${metrics:0:${FLUX_GUARD_BODY_CHARS}}" | tr -d '\r\n')"
+  fi
 
   [ -n "${uptime}" ] && prev_uptime="${uptime}"
   return 0
@@ -164,6 +192,11 @@ while true; do
 
   streak[$verdict]=$(( ${streak[$verdict]} + 1 ))
   flux_log "${verdict} ${streak[$verdict]}/${FLUX_GUARD_FAILURES} (${evidence})"
+  # Only on the first strike of a run: enough to diagnose, not enough to flood a
+  # server that stays broken for hours.
+  if [ -n "${GUARD_BODY}" ] && [ "${streak[$verdict]}" = "1" ]; then
+    flux_log "  metrics said: ${GUARD_BODY}"
+  fi
 
   [ "${streak[$verdict]}" -ge "${FLUX_GUARD_FAILURES}" ] || continue
 

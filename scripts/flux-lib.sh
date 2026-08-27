@@ -150,13 +150,28 @@ flux_rest() {
   [ "${code}" = "200" ]
 }
 
-# Numeric field out of a JSON body without pulling in jq. Prints nothing (and
-# returns 1) when the key is absent, which the caller must treat as "unknown"
-# rather than as zero: "no answer" and "zero fps" are different verdicts.
+# Numeric field out of a JSON body without pulling in jq. Prints nothing on
+# anything it cannot turn into an integer, and the exit code says which kind of
+# nothing it was:
+#
+#   0  the key was there and held an integer, which is printed
+#   1  the key is not in the body at all
+#   2  the key is there but the value is not a plain integer — null, nan, inf,
+#      a bare fraction, scientific notation
+#
+# The three used to be two, and the difference matters. "zero fps", "no fps
+# field" and "fps came back as nan" are three different statements about a
+# server, and a caller that cannot tell the last two apart cannot describe the
+# fault in a log line or in a bug report upstream. Callers that only care whether
+# they got a number can keep ignoring the code; flux_classify does exactly that,
+# on purpose, because both flavours of nothing mean the same thing to it.
 flux_json_num() {
   local body="$1" key="$2" match
   match=$(printf '%s' "${body}" | grep -o "\"${key}\"[[:space:]]*:[[:space:]]*-\?[0-9][0-9]*" | head -1) || true
-  [ -n "${match}" ] || return 1
+  if [ -z "${match}" ]; then
+    printf '%s' "${body}" | grep -q "\"${key}\"[[:space:]]*:" && return 2
+    return 1
+  fi
   printf '%s' "${match##*[[:space:]:]}"
 }
 
@@ -180,6 +195,61 @@ flux_udp_rxq() {
   printf '%s' "${max}"
 }
 
+# How many crash dumps the game has left behind. Each SIGSEGV writes one directory
+# under Saved/Crashes, which is on the persistent volume and therefore survives
+# everything — so the count is a free record of how often this world has crashed,
+# across container rebuilds and node moves alike. Logged once per generation; it
+# is the only crash telemetry we have until the engine writes a Pal.log.
+FLUX_CRASH_DIR="${FLUX_CRASH_DIR:-/palworld/Pal/Saved/Crashes}"
+flux_crash_dump_count() {
+  local n
+  n=$(find "${FLUX_CRASH_DIR}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+  printf '%s' "${n:-0}"
+}
+
+# --- boot phase -------------------------------------------------------------
+# What a customer is waiting for, in four words, from the moment the container
+# starts until players can join.
+#
+# It exists because the dashboard has no other honest answer during a boot. A
+# container that is still pulling 5.15 GB through SteamCMD is up, its domain
+# resolves, and the app is registered — every signal the website reads says
+# "running" while nobody can play for nine minutes.
+#
+# The website could read this off upstream's own log lines instead, and must not:
+# "****Starting Installation****" and "(0x61) downloading, progress:" belong to
+# another project and are free to change shape on any release. This is our
+# contract, in our log, in the same one-line-per-change shape as everything else
+# here — parse `[flux] phase=<name>` and nothing else. Percentages, if the UI
+# wants them, can come from upstream's progress lines as a best-effort extra that
+# degrades to nothing without taking the phase down with it.
+#
+# The phases, in order:
+#   installing  the game is not on disk yet (a fresh container, every time — only
+#               Pal/Saved is persistent, so this is the nine minute case)
+#   starting    files are there, the server process has not been launched yet
+#   loading     the process is up and reading the world into memory
+#   ready       announced separately, by the guard's "server healthy for the
+#               first time this boot" line, because the guard is what knows
+#
+# Pure, and for the same reason flux_classify is: the tests drive the table.
+#   $1 installed   1 when the game files and the appmanifest are both on disk
+#   $2 pid_present 1 when a game process exists
+flux_boot_phase() {
+  local installed="$1" pid_present="$2"
+  [ "${installed}" = "1" ]   || { printf 'installing'; return; }
+  [ "${pid_present}" = "1" ] || { printf 'starting';   return; }
+  printf 'loading'
+}
+
+# The same two files upstream's own IsInstalled() checks, so we agree with it
+# about what "installed" means and cannot report ready on a half-finished pull.
+FLUX_GAME_LAUNCHER="${FLUX_GAME_LAUNCHER:-/palworld/PalServer.sh}"
+FLUX_GAME_MANIFEST="${FLUX_GAME_MANIFEST:-/palworld/steamapps/appmanifest_2394010.acf}"
+flux_game_installed() {
+  [ -e "${FLUX_GAME_LAUNCHER}" ] && [ -e "${FLUX_GAME_MANIFEST}" ]
+}
+
 # 1 when at least one world save exists on disk, 0 otherwise.
 flux_save_present() {
   local f
@@ -199,7 +269,9 @@ flux_save_present() {
 #                       file are allowed to convict
 #   $2 info_ok      1 = /v1/api/info answered 200
 #   $3 metrics_ok   1 = /v1/api/metrics answered 200
-#   $4 fps          serverfps from metrics, empty when unknown
+#   $4 fps          serverfps from metrics; empty means the server answered but
+#                       would not give us a number, which is a fault, not an
+#                       unknown — see the rule below
 #   $5 uptime       uptime from metrics, empty when unknown
 #   $6 prev_uptime  the previous sample's uptime, empty when unknown
 #   $7 rxq          bytes queued on the game's UDP socket
@@ -244,10 +316,32 @@ flux_classify() {
     printf 'worldless'
     return
   fi
-  if [ -n "${fps}" ] && [ "${fps}" -eq 0 ]; then
+
+  # No usable serverfps behind a 200 is the same verdict as zero fps, and it is
+  # the one that matters most: it is the shape this failure actually takes.
+  #
+  # Read seven servers' logs and the world-unloaded state always looks the same —
+  # metrics answers 200, uptime restarts from near zero, and serverfps stops
+  # coming back as a number. Requiring a parseable fps here (the old
+  # `[ -n "${fps}" ] && ...`) meant the signature of the fault was the very thing
+  # that skipped the rule written to catch it, so the verdict stayed 'ok' for as
+  # long as the fault lasted: 79 of 176 observed server-hours across that sample,
+  # once for 19h37m straight.
+  #
+  # This is a level, not an edge. It holds for every sample until the server is
+  # restarted, so it accumulates strikes and convicts, which is what the rule
+  # below cannot do. Convicting here is safe because a server that is merely
+  # starting up answers 000 rather than a 200 with no fps in it, and because
+  # nothing is convicted before FLUX_GUARD_MIN_UPTIME and a first healthy sample.
+  if [ -z "${fps}" ] || [ "${fps}" -eq 0 ]; then
     printf 'worldless'
     return
   fi
+
+  # An edge, and deliberately kept as one: the counter drops once and then climbs
+  # again from its new base, so this can only ever fire on a single sample and can
+  # never reach FLUX_GUARD_FAILURES on its own. It earns its place by naming the
+  # moment the world went away in the log; the rule above is what acts on it.
   if [ -n "${uptime}" ] && [ -n "${prev_uptime}" ] && [ "${uptime}" -lt "${prev_uptime}" ]; then
     printf 'worldless'
     return
@@ -386,7 +480,7 @@ flux_restart_countdown() {
 # since the last autosave, which was lost the moment the fault happened.
 #
 # Enforcing the deadline is flux-entrypoint.sh's job, not ours: it runs as root
-# and can always end the container, while the scheduled reboot runs from cron as
+# and can always end the generation, while the scheduled reboot runs from cron as
 # the steam user and cannot signal init.
 #
 # $1 reason, recorded for the log and for flux-entrypoint.sh's exit code.
@@ -400,6 +494,6 @@ flux_force_restart() {
     flux_log "sending SIGKILL to ${FLUX_GAME_PROCESS} (pid ${pid})"
     kill -KILL "${pid}" 2>/dev/null || flux_log "WARN could not signal pid ${pid} (running as $(id -un))"
   else
-    flux_log "no ${FLUX_GAME_PROCESS} process found; the container is already on its way out"
+    flux_log "no ${FLUX_GAME_PROCESS} process found; this generation is already on its way out"
   fi
 }

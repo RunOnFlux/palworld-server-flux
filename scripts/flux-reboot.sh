@@ -9,13 +9,19 @@
 #      fails ("Do not shutdown if not able to save"). On a server that is leaking,
 #      frozen or worldless — the only servers a restart actually matters for —
 #      the save is exactly what fails, so the nightly restart silently does
-#      nothing on the nights it is needed. Ours always ends with the container
-#      down: it tries the polite route first and then stops asking.
+#      nothing on the nights it is needed. Ours always ends with the server down:
+#      it tries the polite route first and then stops asking. Worth knowing that
+#      the polite route usually is not available — across seven servers, five of
+#      six nightly restarts found no world to save and went ahead without one.
 #   2. Upstream authenticates as admin:${ADMIN_PASSWORD}, the env var, which is
 #      empty on every server we sell; the ini holds the real password. We read
 #      both (flux_admin_password).
-#   3. Upstream's exit is a plain "the game ended". Ours leaves a marker so PID 1
-#      exits deliberately and the platform brings the container back.
+#   3. Upstream's exit is a plain "the game ended". Ours leaves a marker, which is
+#      how PID 1 tells a restart we asked for apart from a server that died on its
+#      own, and what arms the deadline that stops a wedged shutdown hanging the
+#      generation forever. The marker does NOT end the container: under the
+#      default FLUX_RESTART_MODE=process the supervisor starts the next generation
+#      in place, so a nightly restart costs about thirty seconds and no download.
 #
 # Env (upstream's names, unchanged):
 #   AUTO_REBOOT_WARN_MINUTES              in-game countdown before the restart
@@ -73,9 +79,19 @@ main() {
   players="$(players_online)" || players=""
   flux_log "scheduled restart starting (players=${players:-unknown}, even_if_players_online=${EVEN_IF_PLAYERS_ONLINE})"
 
-  if [ "${EVEN_IF_PLAYERS_ONLINE,,}" != "true" ] && [ -n "${players}" ] && [ "${players}" -gt 0 ]; then
-    flux_log "skipping: ${players} player(s) online"
-    exit 0
+  if [ "${EVEN_IF_PLAYERS_ONLINE,,}" != "true" ]; then
+    if [ -n "${players}" ] && [ "${players}" -gt 0 ]; then
+      flux_log "skipping: ${players} player(s) online"
+      exit 0
+    fi
+    # Deliberate, but say so out loud. The "cannot ask" branch is not the rare
+    # case it reads like: a server whose world has unloaded answers 200 with no
+    # player count in it, and that is the state most servers are in by the time
+    # this runs. Silently, AUTO_REBOOT_EVEN_IF_PLAYERS_ONLINE=false then does
+    # nothing at all, and someone reading the setting deserves to know.
+    if [ -z "${players}" ]; then
+      flux_log "WARN could not read the player count; restarting anyway, which overrides AUTO_REBOOT_EVEN_IF_PLAYERS_ONLINE=false"
+    fi
   fi
 
   # Nothing to stop: the supervisor is already dealing with whatever happened, and
@@ -86,7 +102,7 @@ main() {
     exit 0
   fi
 
-  # From here on the container WILL go down. The marker goes in first so that
+  # From here on the server WILL go down. The marker goes in first so that
   # however the process ends — polite shutdown, SIGKILL, or the server dying on
   # its own halfway through — PID 1 knows this was on purpose.
   printf '%s\n' "scheduled restart" >"${FLUX_RESTART_MARKER}" 2>/dev/null || true
@@ -106,6 +122,10 @@ main() {
     flux_log "WARN world is not loaded (or cannot be queried); skipping the save so nothing overwrites the last good one"
   fi
 
+  # Accepted is not the same as done. On a server whose world has already gone,
+  # every observed shutdown ended in a segfault about a second later rather than a
+  # clean exit — same outcome, so nothing here needs to change, but it is why the
+  # graceful wait below almost never gets used.
   if flux_rest shutdown '{"waittime":1,"message":"Restarting"}'; then
     flux_log "shutdown accepted, waiting up to ${GRACEFUL_WAIT}s for the server to exit"
   else

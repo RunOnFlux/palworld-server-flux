@@ -48,6 +48,12 @@ check "REST API gone" unresponsive "$(flux_classify 1 0 0 "" "" 4940 0 65536 1)"
 # Mode B: the process and the API are up, the world is not.
 check "metrics gone while info answers" worldless "$(flux_classify 1 1 0 "" "" 4940 0 65536 1)"
 check "zero fps" worldless "$(flux_classify 1 1 1 0 12 749 0 65536 1)"
+# The shape this failure actually takes in production: a 200 with a body we
+# cannot get a serverfps out of. It held for hours on every server we have logs
+# for, so it has to be a conviction and not an "unknown".
+check "200 with no readable serverfps" worldless "$(flux_classify 1 1 1 "" 44 22727 0 65536 1)"
+check "200 with no readable serverfps, and uptime climbing again" \
+  worldless "$(flux_classify 1 1 1 "" 104 44 0 65536 1)"
 check "uptime went backwards" worldless "$(flux_classify 1 1 1 59 12 749 0 65536 1)"
 check "uptime equal to the previous sample" ok "$(flux_classify 1 1 1 59 749 749 0 65536 1)"
 check "the save vanished" worldless "$(flux_classify 1 1 1 59 5000 4940 0 65536 0)"
@@ -56,6 +62,78 @@ check "the save vanished" worldless "$(flux_classify 1 1 1 59 5000 4940 0 65536 
 check "401 with everything else fine" ok "$(flux_classify 0 0 0 "" "" 4940 0 65536 1)"
 check "401 does not stop the socket check" stalled "$(flux_classify 0 0 0 "" "" 4940 110400 65536 1)"
 check "401 does not stop the save check" worldless "$(flux_classify 0 0 0 "" "" 4940 0 65536 0)"
+
+# The classifier is pure, which is what makes the table above possible — and is
+# also what let a rule that can never fire sit here passing for months. These
+# drive a whole run of samples through the same streak accounting the guard loop
+# uses, which is where that bug actually lived.
+echo "flux_classify over a run of samples"
+
+# args: rxq_limit, then one "fps:uptime" pair per sample.
+# Returns the highest consecutive worldless streak the run would produce.
+worldless_streak() {
+  local limit="$1" prev="" streak=0 best=0 fps uptime verdict
+  shift
+  for sample in "$@"; do
+    fps="${sample%%:*}"
+    uptime="${sample##*:}"
+    verdict="$(flux_classify 1 1 1 "${fps}" "${uptime}" "${prev}" 0 "${limit}" 1)"
+    if [ "${verdict}" = "worldless" ]; then
+      streak=$((streak + 1))
+      [ "${streak}" -gt "${best}" ] && best="${streak}"
+    else
+      streak=0
+    fi
+    [ -n "${uptime}" ] && prev="${uptime}"
+  done
+  printf '%s' "${best}"
+}
+
+# The real trace, from 1785894699157 and six others: uptime resets once and then
+# climbs again, and serverfps never comes back. Before the fix this peaked at 1
+# and the guard watched the world stay dead for up to 19 hours.
+check "a world that unloads and stays unloaded convicts" \
+  3 "$(worldless_streak 65536 59:5565 59:5625 "":39 "":99 "":159)"
+
+# The uptime rule on its own is an edge and cannot convict — that is why the
+# rule above has to carry it. Left here so nobody re-derives it the hard way.
+check "an uptime reset alone never reaches three" \
+  1 "$(worldless_streak 65536 59:5565 59:5625 59:39 59:99 59:159)"
+
+# And the case that must never convict: a healthy server, players or not.
+check "a healthy run never strikes" \
+  0 "$(worldless_streak 65536 59:60 59:120 30:180 59:240 59:300)"
+
+echo "flux_boot_phase"
+# args: installed pid_present
+check "a fresh container is still pulling the game" \
+  installing "$(flux_boot_phase 0 0)"
+check "files on disk but the server not launched yet" \
+  starting "$(flux_boot_phase 1 0)"
+check "the process is up and reading the world in" \
+  loading "$(flux_boot_phase 1 1)"
+# A half-finished pull leaves PalServer.sh on disk without the appmanifest, and
+# upstream would call that not-installed too. Never report past `installing` on it.
+check "a process without the files is still installing" \
+  installing "$(flux_boot_phase 0 1)"
+
+echo "flux_game_installed"
+FLUX_GAME_LAUNCHER="${tmp}/PalServer.sh"
+FLUX_GAME_MANIFEST="${tmp}/appmanifest_2394010.acf"
+installed_says() { if flux_game_installed; then printf yes; else printf no; fi; }
+check "nothing on disk" no "$(installed_says)"
+touch "${FLUX_GAME_LAUNCHER}"
+check "launcher without the manifest is not installed" no "$(installed_says)"
+touch "${FLUX_GAME_MANIFEST}"
+check "both present" yes "$(installed_says)"
+rm -f "${FLUX_GAME_LAUNCHER}" "${FLUX_GAME_MANIFEST}"
+
+echo "flux_json_num exit codes"
+check "an integer" 59 "$(flux_json_num '{"serverfps":59,"uptime":12}' serverfps)"
+flux_json_num '{"uptime":12}' serverfps >/dev/null; check "absent key returns 1" 1 "$?"
+flux_json_num '{"serverfps":nan,"uptime":12}' serverfps >/dev/null; check "nan returns 2" 2 "$?"
+flux_json_num '{"serverfps":null,"uptime":12}' serverfps >/dev/null; check "null returns 2" 2 "$?"
+flux_json_num '{"serverfps":-1,"uptime":12}' serverfps >/dev/null; check "a negative integer still parses" 0 "$?"
 
 echo "flux_admin_password"
 write_ini() { printf '[/Script/Pal.PalGameWorldSettings]\nOptionSettings=(Difficulty=None,ServerPassword="pw",AdminPassword=%s,PublicPort=8211)\n' "$1" >"${FLUX_SETTINGS_INI}"; }
