@@ -57,12 +57,21 @@ case "${STUB_MODE:-linger}" in
   server)
     # Stands in for a running Palworld server: a process with the name the guard
     # looks for, and the two REST endpoints it reads, served from a file the test
-    # rewrites to make the world disappear underneath it.
+    # rewrites to make the world disappear underneath it. Two flag files let a test
+    # reach the states the file alone cannot describe:
+    #   /tmp/force401  every request is refused, the way a server with no
+    #                  AdminPassword refuses ours
+    #   /tmp/stall     headers go out and then nothing does, which is what a wedged
+    #                  game thread looks like from the probe's side
     printf '{"serverfps":59,"currentplayernum":1,"uptime":600,"days":523}' > /tmp/metrics.json
     python3 -c '
-import http.server
+import http.server, os, time
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if os.path.exists("/tmp/force401"):
+            self.send_response(401)
+            self.send_header("Content-Length","0")
+            self.end_headers(); return
         if self.path.startswith("/v1/api/metrics"):
             body = open("/tmp/metrics.json","rb").read()
         elif self.path.startswith("/v1/api/info"):
@@ -73,12 +82,24 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type","application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        if os.path.exists("/tmp/stall"):
+            # Single threaded on purpose: one wedged request wedges the whole API,
+            # which is the mode A shape. Clearing the flag lets it go again.
+            while os.path.exists("/tmp/stall"): time.sleep(0.2)
+            return
         self.wfile.write(body)
     def log_message(self, *a): pass
 http.server.HTTPServer(("127.0.0.1", 8212), H).serve_forever()
 ' &
     ( exec -a PalServer-Linux-Shipping sleep 600 ) &
     game_pid=$!
+    # A /proc the test can write to, so a world unload can take its gigabytes with
+    # it the way a real one does. Only used when FLUX_PROC_ROOT points here.
+    if [ -n "${FLUX_FAKE_PROC:-}" ]; then
+      mkdir -p "${FLUX_FAKE_PROC}/${game_pid}"
+      printf 'Name:\tPalServer-Lin\nVmRSS:\t %s kB\n' "${FAKE_RSS_KB:-3168996}" \
+        >"${FLUX_FAKE_PROC}/${game_pid}/status"
+    fi
     echo "stub: fake server up (pid ${game_pid})"
     wait "${game_pid}"
     echo "stub: fake server gone, ending like start.sh does"
@@ -135,6 +156,20 @@ wait_for() {
     sleep 1
   done
   printf '  FAIL timed out after %ss waiting for: %s\n' "$2" "$1"
+  failures=$((failures + 1))
+  return 1
+}
+
+# wait_for_count <text> <times> <seconds>
+# For a line that comes once per generation. `wait_for` on one of those is
+# satisfied by the previous generation's copy and returns before anything has
+# happened, which turns the next step into a race.
+wait_for_count() {
+  for _ in $(seq 1 "$3"); do
+    [ "$(logs | grep -cF "$1")" -ge "$2" ] && return 0
+    sleep 1
+  done
+  printf '  FAIL timed out after %ss waiting for %s copies of: %s\n' "$3" "$2" "$1"
   failures=$((failures + 1))
   return 1
 }
@@ -198,11 +233,16 @@ if run_stub server -e FLUX_GUARD_FAILURES=2 -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_G
   check "a working server is left alone" yes "$(saw 'healthy for the first time')"
 
   # The signature from the incident: same process, uptime restarted from zero, no
-  # world behind the API.
+  # world behind the API. That pair cannot happen to a working server, so it is
+  # acted on at once — no second and third strike, and no countdown announced into
+  # a world that is not there to hear it. On 1785894699157 that patience cost three
+  # minutes of every five minute recovery, 23 times over.
   docker exec "${CONTAINER}" sh -c 'printf "{\"serverfps\":0,\"currentplayernum\":0,\"uptime\":12,\"days\":0}" > /tmp/metrics.json'
   wait_for "starting the server (generation 2)" 60
-  check "the world loss is detected" yes "$(saw 'worldless 2/2 (rest=200 metrics=1 fps=0')"
-  check "players are warned before anything happens" yes "$(saw 'warning players and restarting in 4s')"
+  check "the world loss is detected" yes "$(saw 'worldless 1/1 (rest=200 metrics=1 fps=0')"
+  check "and acted on without waiting for more of the same" \
+    yes "$(saw 'the world is provably gone, so there is nobody to warn — restarting now')"
+  check "no countdown is announced to an empty world" no "$(saw 'warning players and restarting in 4s')"
   check "the server is killed" yes "$(saw 'sending SIGKILL to PalServer-Linux-Shipping')"
   check "and replaced in place" yes "$(saw 'starting the server (generation 2)')"
   check "the container never ended" true "$(docker inspect -f '{{.State.Running}}' ${CONTAINER})"
@@ -210,14 +250,146 @@ if run_stub server -e FLUX_GUARD_FAILURES=2 -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_G
 fi
 
 echo "a server that recovers during the countdown"
+# Deliberately the OTHER shape of a world loss: serverfps stops coming back but the
+# uptime counter keeps climbing, which is every sample after the one where the
+# world actually went. That is evidence, not proof, so it still costs two strikes
+# and still warns the players — and is still allowed to change its mind.
 if run_stub server -e FLUX_GUARD_FAILURES=2 -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_GUARD_RESTART_DELAY=20; then
   wait_for "healthy for the first time" 30
-  docker exec "${CONTAINER}" sh -c 'printf "{\"serverfps\":0,\"uptime\":12}" > /tmp/metrics.json'
+  docker exec "${CONTAINER}" sh -c 'printf "{\"currentplayernum\":0,\"uptime\":900}" > /tmp/metrics.json'
   wait_for "warning players and restarting in 20s" 30
-  docker exec "${CONTAINER}" sh -c 'printf "{\"serverfps\":59,\"uptime\":900}" > /tmp/metrics.json'
+  check "unproven evidence still waits for a second opinion" yes "$(saw 'worldless 2/2')"
+  docker exec "${CONTAINER}" sh -c 'printf "{\"serverfps\":59,\"uptime\":960}" > /tmp/metrics.json'
   wait_for "restart cancelled" 40
   check "the restart is called off" yes "$(saw 'restart cancelled: the server recovered')"
   check "and nothing was killed" no "$(saw 'sending SIGKILL')"
+fi
+
+echo "a world that keeps unloading"
+# A rebuilt container cannot fix a bug in the game that only reproduces on this
+# customer's save, and buying one costs a full SteamCMD install. Restarts that the
+# in-place restart demonstrably fixes must not spend the budget that ends the
+# container — with FLUX_RESTART_MAX_ATTEMPTS=1, the old accounting ended it here.
+if run_stub server -e FLUX_GUARD_FAILURES=2 -e FLUX_GUARD_MIN_UPTIME=0 \
+    -e FLUX_GUARD_RESTART_DELAY=0 -e FLUX_RESTART_MAX_ATTEMPTS=1; then
+  unload() { docker exec "${CONTAINER}" sh -c 'printf "{\"serverfps\":0,\"uptime\":12}" > /tmp/metrics.json'; }
+  wait_for "healthy for the first time" 30
+  unload
+  wait_for "starting the server (generation 2)" 60
+  wait_for_count "healthy for the first time" 2 60
+  unload
+  wait_for "starting the server (generation 3)" 60
+  check "a world unload is not charged to the restart budget" \
+    yes "$(saw 'not counted against the 1-in-3600s budget')"
+  check "so the container is still up after more unloads than the budget allows" \
+    true "$(docker inspect -f '{{.State.Running}}' ${CONTAINER})"
+fi
+
+# Everything below drives the guard through a writable /proc, so the memory the
+# world lives in can be taken away from it the way a real unload does.
+fake_proc=(-e FLUX_PROC_ROOT=/tmp/fakeproc -e FLUX_FAKE_PROC=/tmp/fakeproc)
+collapse_rss() {
+  docker exec "${CONTAINER}" sh -c \
+    'for d in /tmp/fakeproc/*/; do printf "VmRSS:\t 1030908 kB\n" > "$d/status"; done'
+}
+
+echo "a world that unloads without moving the uptime counter"
+# Every sample after the one where the world went: serverfps stops coming back but
+# uptime climbs on from its new base, so the edge that proves it is already gone.
+# Resident memory is the half that is a level rather than an edge, and it is what
+# covers a sample lost to a timeout — 3.2 GB down to 1.0 GB, the real numbers off
+# the crash dumps.
+if run_stub server "${fake_proc[@]}" -e FLUX_GUARD_FAILURES=3 -e FLUX_GUARD_MIN_UPTIME=0 \
+    -e FLUX_GUARD_RESTART_DELAY=4; then
+  wait_for "healthy for the first time" 30
+  check "the peak is picked up while the world is loaded" yes "$(saw 'peak=3094M')"
+  docker exec "${CONTAINER}" sh -c 'printf "{\"currentplayernum\":0,\"uptime\":900}" > /tmp/metrics.json'
+  collapse_rss
+  wait_for "starting the server (generation 2)" 60
+  check "the collapse is what convicts" yes "$(saw 'worldless 1/1 (rest=200 metrics=1 fps=- players=0 uptime=900')"
+  check "and it is visible in the evidence" yes "$(saw 'rss=1006M peak=3094M')"
+  check "acted on at once, with no countdown" \
+    yes "$(saw 'the world is provably gone, so there is nobody to warn — restarting now')"
+  check "the container never ended" true "$(docker inspect -f '{{.State.Running}}' ${CONTAINER})"
+fi
+
+echo "the same world unload behind a 401"
+# The hole the memory signal was added to close: with the API refusing us, mode B
+# has no symptom the other rules can see. It convicts — but the patient way, since
+# there is nothing left to cross-check a single reading against.
+if run_stub server "${fake_proc[@]}" -e FLUX_GUARD_FAILURES=3 -e FLUX_GUARD_MIN_UPTIME=0 \
+    -e FLUX_GUARD_RESTART_DELAY=4; then
+  wait_for "healthy for the first time" 30
+  docker exec "${CONTAINER}" sh -c 'touch /tmp/force401'
+  collapse_rss
+  wait_for "starting the server (generation 2)" 90
+  check "a world unload is seen at all through a 401" yes "$(saw 'worldless 1/3 (rest=401')"
+  check "but never on one sample" yes "$(saw 'worldless 3/3 (rest=401')"
+  check "and the players are still warned" yes "$(saw 'warning players and restarting in 4s')"
+  check "the bad credentials are called out too" yes "$(saw 'no usable admin password')"
+  docker exec "${CONTAINER}" sh -c 'rm -f /tmp/force401'
+fi
+
+echo "a world that unloads between two samples"
+# The wait between samples is where the remaining detection latency lives: half a
+# sample interval on average, and nothing about the REST API can be made cheaper
+# to ask. Memory can — it is a read from /proc, invisible to the game — so it is
+# watched all the way through the wait. The collapse is dropped in immediately
+# after a sample, so the next scheduled one is nearly a full interval away and
+# everything below has to time out without the early wake.
+if run_stub server "${fake_proc[@]}" -e FLUX_GUARD_INTERVAL=30 -e FLUX_GUARD_RSS_POLL=1 \
+    -e FLUX_GUARD_FAILURES=3 -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_GUARD_RESTART_DELAY=4; then
+  wait_for "healthy for the first time" 60
+  docker exec "${CONTAINER}" sh -c 'printf "{\"currentplayernum\":0,\"uptime\":900}" > /tmp/metrics.json'
+  collapse_rss
+  wait_for "sampling now rather than in" 12
+  check "the wait is cut short by the collapse" yes "$(saw 'resident memory fell to 1006M')"
+  wait_for "starting the server (generation 2)" 15
+  check "and the sample it brings forward decides as it always would" \
+    yes "$(saw 'worldless 1/1')"
+fi
+
+echo "memory that falls without the world going with it"
+# The failure mode of the idea above: a collapse the full sample then calls
+# healthy is still a collapse on the next glance, and on the one after that. Left
+# as a level it would wake the guard every second for the life of the generation,
+# each wake costing a REST call. It is an edge — one wake per fall, re-armed only
+# when memory comes back.
+if run_stub server "${fake_proc[@]}" -e FLUX_GUARD_INTERVAL=10 -e FLUX_GUARD_RSS_POLL=1 \
+    -e FLUX_GUARD_FAILURES=3 -e FLUX_GUARD_MIN_UPTIME=0; then
+  wait_for "healthy for the first time" 60
+  collapse_rss                      # ...while metrics keeps reporting fps 59
+  wait_for "sampling now rather than in" 20
+  sleep 15
+  check "it wakes once, not once a second" 1 "$(logs | grep -c 'sampling now rather than in')"
+  check "and nothing is restarted over it" no "$(saw 'generation 2')"
+  # Memory back where it was: the wake re-arms, and a second fall is seen again.
+  docker exec "${CONTAINER}" sh -c \
+    'for d in /tmp/fakeproc/*/; do printf "VmRSS:\t 3168996 kB\n" > "$d/status"; done'
+  sleep 12
+  collapse_rss
+  wait_for_count "sampling now rather than in" 2 20
+  check "a later fall is seen again" 2 "$(logs | grep -c 'sampling now rather than in')"
+fi
+
+echo "a server that sends its headers and then stops"
+# curl exits 28 with %{http_code} already set to 200 and an empty body behind it.
+# Read literally that is "the API answered and reported no world" — a stalled
+# server diagnosed as a world unload, which is the wrong word in the log and now
+# the wrong side of the restart budget too.
+if run_stub server -e FLUX_GUARD_FAILURES=2 -e FLUX_GUARD_MIN_UPTIME=0 \
+    -e FLUX_GUARD_RESTART_DELAY=0 -e FLUX_REST_TIMEOUT=2 -e FLUX_RESTART_MAX_ATTEMPTS=1; then
+  wait_for "healthy for the first time" 30
+  docker exec "${CONTAINER}" sh -c 'touch /tmp/stall'
+  wait_for "starting the server (generation 2)" 90
+  # The discriminating one is the second: before the fix the first strike after
+  # the stall was `worldless 1/2 (rest=200 metrics=1 fps=-`. The first assertion
+  # holds either way, because a wedged single-threaded API stops answering
+  # outright on the samples after it, and is here only to pin the verdict's shape.
+  check "a stall reads as no answer at all" yes "$(saw 'unresponsive 1/2 (rest=000')"
+  check "and is never mistaken for a world unload" no "$(saw 'worldless')"
+  check "so it is charged to the restart budget" yes "$(saw '(1/1 within 3600s)')"
+  docker exec "${CONTAINER}" sh -c 'rm -f /tmp/stall'
   remove_container
 fi
 

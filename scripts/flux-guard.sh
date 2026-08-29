@@ -14,7 +14,9 @@
 #
 # Neither recovers on its own and only a restart clears them. This loop samples
 # the server once a minute, needs the same verdict FLUX_GUARD_FAILURES times in a
-# row before it believes it, and then kills the game process. What happens next is
+# row before it believes it — unless the sample already proves the world is gone,
+# which costs a restart nothing to act on immediately (flux_worldless_is_proven) —
+# and then kills the game process. What happens next is
 # flux-entrypoint.sh's call, not ours: under the default FLUX_RESTART_MODE=process
 # it sweeps the generation and starts a fresh one inside the same container, in
 # about thirty seconds and without re-downloading anything. The container only
@@ -57,9 +59,20 @@ save_seen_once=0
 seen_healthy=0
 auth_ok=1
 auth_warned_at=0
+# The highest resident memory this generation has reached. Carried between
+# samples for the same reason prev_uptime is: the fault is a fall from it, and a
+# single reading cannot show a fall.
+rss_peak=0
 GUARD_VERDICT="ok"
 GUARD_EVIDENCE=""
 GUARD_BODY=""
+GUARD_PROVEN=0
+GUARD_PID=""
+GUARD_RSS_DROPPED=0
+# The early wake in flux_guard_wait is an edge: it fires once per collapse and
+# stays down until a full sample sees memory back above the line. Without that, a
+# fall the sample then calls healthy would wake us every few seconds forever.
+rss_wake_armed=1
 declare -A streak=([stalled]=0 [unresponsive]=0 [worldless]=0)
 
 # Collects one sample. Sets GUARD_VERDICT and GUARD_EVIDENCE, and updates the
@@ -69,7 +82,7 @@ declare -A streak=([stalled]=0 [unresponsive]=0 [worldless]=0)
 # went backwards — that can only be seen by comparing two samples.
 flux_guard_sample() {
   local metrics info_ok=0 metrics_ok=0 fps="" uptime="" players="" rxq save_present code now
-  local fps_rc=0
+  local fps_rc=0 pid rss rss_dropped=0
 
   # Metrics first, and on a healthy server that is the only call made. The game
   # writes a line to its own console for REST activity, and this loop runs for
@@ -109,6 +122,18 @@ flux_guard_sample() {
 
   rxq="$(flux_udp_rxq "${PORT:-8211}")"
   save_present="$(flux_save_present)"
+
+  # Read once and reused for the evidence line, so the pid in the log is the pid
+  # the memory reading came from.
+  pid="$(flux_game_pid)"
+  rss="$(flux_game_rss_kb "${pid}")"
+  [ "${rss}" -gt "${rss_peak}" ] && rss_peak="${rss}"
+  flux_rss_collapsed "${rss}" "${rss_peak}" && rss_dropped=1
+  # Read by the loop: the pid and peak the wait between samples watches, and the
+  # level it re-arms the early wake on.
+  GUARD_PID="${pid}"
+  GUARD_RSS_DROPPED="${rss_dropped}"
+
   # A server that has never had a save is a server whose world has not been
   # written yet, not a server that lost one.
   if [ "${save_present}" = "1" ]; then
@@ -118,16 +143,23 @@ flux_guard_sample() {
   fi
 
   GUARD_VERDICT="$(flux_classify "${auth_ok}" "${info_ok}" "${metrics_ok}" "${fps}" \
-    "${uptime}" "${prev_uptime}" "${rxq}" "${FLUX_GUARD_RXQ_BYTES}" "${save_present}")"
+    "${uptime}" "${prev_uptime}" "${rxq}" "${FLUX_GUARD_RXQ_BYTES}" "${save_present}" \
+    "${rss_dropped}")"
+  # Whether this one sample already settles it. Read by the loop to decide how
+  # many strikes to wait for and whether a countdown would reach anybody.
+  GUARD_PROVEN=0
+  flux_worldless_is_proven "${GUARD_VERDICT}" "${fps}" "${uptime}" "${prev_uptime}" \
+    "${rss_dropped}" "${auth_ok}" && GUARD_PROVEN=1
   # fps=- is ambiguous on its own and the ambiguity cost us months: "no such
   # field" and "the field is there and says nan" are different bugs. rc 2 is the
   # second one.
   local fps_shown="${fps:--}"
   [ -z "${fps}" ] && [ "${fps_rc}" = "2" ] && fps_shown="unreadable"
 
-  GUARD_EVIDENCE="$(printf 'rest=%s metrics=%s fps=%s players=%s uptime=%s prev_uptime=%s rxq=%s save=%s pid=%s' \
+  GUARD_EVIDENCE="$(printf 'rest=%s metrics=%s fps=%s players=%s uptime=%s prev_uptime=%s rxq=%s save=%s rss=%sM peak=%sM pid=%s' \
     "${code}" "${metrics_ok}" "${fps_shown}" "${players:--}" "${uptime:--}" \
-    "${prev_uptime:--}" "${rxq}" "${save_present}" "$(flux_game_pid)")"
+    "${prev_uptime:--}" "${rxq}" "${save_present}" \
+    "$((rss / 1024))" "$((rss_peak / 1024))" "${pid}")"
 
   # Kept for the caller to log when it does not like the verdict. Without it a
   # strike says "fps=-" and nothing else, and there is no way after the fact to
@@ -140,6 +172,18 @@ flux_guard_sample() {
 
   [ -n "${uptime}" ] && prev_uptime="${uptime}"
   return 0
+}
+
+# True when some verdict already has strikes against it. While that holds, the
+# wait between samples is left exactly as configured — bringing samples forward
+# inside a strike run would turn three strikes into fifteen seconds and hand a
+# run of unlucky samples the power to restart a healthy server.
+flux_guard_striking() {
+  local k
+  for k in "${!streak[@]}"; do
+    [ "${streak[$k]}" -gt 0 ] && return 0
+  done
+  return 1
 }
 
 # What the players are told, per verdict. Deliberately plain: whoever reads it is
@@ -168,15 +212,21 @@ if [ "${FLUX_GUARD_ENABLED,,}" != "true" ]; then
   exit 0
 fi
 
-flux_log "guard armed: every ${FLUX_GUARD_INTERVAL}s, ${FLUX_GUARD_FAILURES} strikes, rxq limit ${FLUX_GUARD_RXQ_BYTES} bytes, min uptime ${FLUX_GUARD_MIN_UPTIME}s, dry_run=${FLUX_GUARD_DRY_RUN}"
+flux_log "guard armed: every ${FLUX_GUARD_INTERVAL}s (memory watched every ${FLUX_GUARD_RSS_POLL}s), ${FLUX_GUARD_FAILURES} strikes (1 when the world loss is proven), rxq limit ${FLUX_GUARD_RXQ_BYTES} bytes, rss drop $((FLUX_GUARD_RSS_DROP_KB / 1024))M, min uptime ${FLUX_GUARD_MIN_UPTIME}s, dry_run=${FLUX_GUARD_DRY_RUN}"
 
 while true; do
-  sleep "${FLUX_GUARD_INTERVAL}"
+  early=0
+  [ "${rss_wake_armed}" = "1" ] && ! flux_guard_striking && early=1
+  # Returns non-zero when it cut the wait short, which also spends the edge: the
+  # sample below is what decides, and if it decides the server is fine the wake
+  # stays down until memory comes back above the line.
+  flux_guard_wait "${early}" "${GUARD_PID}" "${rss_peak}" || rss_wake_armed=0
 
   # No game process means the container is already on its way out; nothing to do.
   [ -n "$(flux_game_pid)" ] || continue
 
   flux_guard_sample
+  [ "${GUARD_RSS_DROPPED}" = "1" ] || rss_wake_armed=1
   verdict="${GUARD_VERDICT}"
   evidence="${GUARD_EVIDENCE}"
 
@@ -190,15 +240,34 @@ while true; do
     continue
   fi
 
+  # Patience is for evidence that might be a hiccup. A sample that already proves
+  # the world is gone gets none: waiting two more minutes and then announcing a
+  # countdown into a world that does not exist is three minutes of a five minute
+  # recovery spent on nobody's behalf. See flux_worldless_is_proven.
+  if [ "${GUARD_PROVEN}" = "1" ]; then
+    needed=1
+    delay=0
+  else
+    needed="${FLUX_GUARD_FAILURES}"
+    delay="${FLUX_GUARD_RESTART_DELAY}"
+  fi
+
   streak[$verdict]=$(( ${streak[$verdict]} + 1 ))
-  flux_log "${verdict} ${streak[$verdict]}/${FLUX_GUARD_FAILURES} (${evidence})"
+  # Past the threshold the fraction stops meaning anything — a held server prints
+  # "worldless 7/3" and reads like a counter that has run away. It only happens
+  # under the min-uptime hold below, and there the honest line says so.
+  if [ "${streak[$verdict]}" -gt "${needed}" ]; then
+    flux_log "${verdict} still, ${streak[$verdict]} samples in (${evidence})"
+  else
+    flux_log "${verdict} ${streak[$verdict]}/${needed} (${evidence})"
+  fi
   # Only on the first strike of a run: enough to diagnose, not enough to flood a
   # server that stays broken for hours.
   if [ -n "${GUARD_BODY}" ] && [ "${streak[$verdict]}" = "1" ]; then
     flux_log "  metrics said: ${GUARD_BODY}"
   fi
 
-  [ "${streak[$verdict]}" -ge "${FLUX_GUARD_FAILURES}" ] || continue
+  [ "${streak[$verdict]}" -ge "${needed}" ] || continue
 
   # Guards against acting on a server that never worked in the first place.
   age=$(( $(date -u +%s) - started_at ))
@@ -207,8 +276,11 @@ while true; do
     streak[$verdict]=0
     continue
   fi
+  # A fresh guard is started for every generation, so this is the age of the
+  # generation, not of the container — the distinction matters when reading the
+  # log of a container that has been up for days.
   if [ "${age}" -lt "${FLUX_GUARD_MIN_UPTIME}" ]; then
-    flux_log "holding: ${verdict} confirmed but the container is only ${age}s old (min ${FLUX_GUARD_MIN_UPTIME}s)"
+    flux_log "holding: ${verdict} confirmed but this generation is only ${age}s old (min ${FLUX_GUARD_MIN_UPTIME}s)"
     continue
   fi
 
@@ -218,12 +290,16 @@ while true; do
     continue
   fi
 
-  flux_log "ACTION ${verdict} confirmed ${FLUX_GUARD_FAILURES} times (${evidence}); warning players and restarting in ${FLUX_GUARD_RESTART_DELAY}s"
-  flux_restart_countdown "${FLUX_GUARD_RESTART_DELAY}" "$(flux_guard_message "${verdict}")"
+  if [ "${delay}" -gt 0 ]; then
+    flux_log "ACTION ${verdict} confirmed $(flux_times "${needed}") (${evidence}); warning players and restarting in ${delay}s"
+  else
+    flux_log "ACTION ${verdict} confirmed $(flux_times "${needed}") (${evidence}); the world is provably gone, so there is nobody to warn — restarting now"
+  fi
+  flux_restart_countdown "${delay}" "$(flux_guard_message "${verdict}")"
 
   # One last look before pulling the trigger. A server that came back during the
   # countdown does not need restarting, and this is the cheapest place to find out.
-  if [ "${FLUX_GUARD_RESTART_DELAY}" -gt 0 ]; then
+  if [ "${delay}" -gt 0 ]; then
     flux_guard_sample
     if [ "${GUARD_VERDICT}" = "ok" ]; then
       flux_log "restart cancelled: the server recovered during the countdown (${GUARD_EVIDENCE})"
@@ -233,6 +309,9 @@ while true; do
     fi
   fi
 
-  flux_force_restart "${verdict} confirmed ${FLUX_GUARD_FAILURES} times (${evidence})"
+  # The reason starts with the verdict on purpose: flux-entrypoint.sh reads it
+  # back off the marker to decide whether this restart says anything is wrong with
+  # the container. See flux_restart_counts_against_budget.
+  flux_force_restart "${verdict} confirmed $(flux_times "${needed}") (${evidence})"
   exit 0
 done

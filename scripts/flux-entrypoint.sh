@@ -18,6 +18,9 @@
 # in-place restarts inside FLUX_RESTART_WINDOW seconds, this stops trying and ends
 # the container so FluxOS can rebuild it (or move it), which is the right answer to
 # a server that cannot stay up. FLUX_RESTART_MODE=container skips straight to that.
+# Only the restarts that say something is wrong with this container are counted;
+# a world unload and the nightly reboot are not, because a rebuild costs nine
+# minutes and fixes neither (flux_restart_counts_against_budget).
 #
 # What it does not touch: `docker stop`. A signal from the platform is honoured,
 # forwarded to init.sh so upstream's own SIGTERM handler saves the world, and the
@@ -108,6 +111,10 @@ start_generation() {
   if [ "${generation}" -gt 1 ] && [ "${crash_dumps}" -gt "${before}" ]; then
     flux_log "the game left $(( crash_dumps - before )) new crash dump(s) in ${FLUX_CRASH_DIR} since the last generation"
   fi
+  # Counted first, then trimmed: the count above is the honest one, and the volume
+  # it lands on is the customer's and is never emptied by anything else.
+  flux_prune_crash_dumps
+  crash_dumps="$(flux_crash_dump_count)"
 
   # Before anything reads it: a server with no settings file gets one, with the
   # REST API on and an admin password, which is what everything else here depends
@@ -159,7 +166,7 @@ sweep_generation() {
 # keeps the guard alive for as long as the server is: a probe that died silently
 # is a server with no protection at all.
 wait_for_generation() {
-  local rc marker_seen=0 now phase last_phase=""
+  local rc marker_seen=0 forced=0 now phase last_phase=""
   # Stops the moment the server process exists: from there the guard owns the
   # story, and this loop goes back to costing nothing.
   local watch_boot=1
@@ -188,7 +195,13 @@ wait_for_generation() {
       now="$(date -u +%s)"
       [ "${marker_seen}" = "0" ] && marker_seen="${now}"
       if [ $((now - marker_seen)) -ge "${FLUX_RESTART_GRACE:-60}" ]; then
-        flux_log "WARN a restart was requested ${FLUX_RESTART_GRACE:-60}s ago and the server is still winding down; forcing this generation to end"
+        # Once. This loop ticks every second and a process can take a moment to
+        # go, which used to put the same WARN in the log two and three times over
+        # and read like the deadline firing repeatedly.
+        if [ "${forced}" = "0" ]; then
+          forced=1
+          flux_log "WARN a restart was requested ${FLUX_RESTART_GRACE:-60}s ago and the server is still winding down; forcing this generation to end"
+        fi
         kill -KILL "${init_pid}" 2>/dev/null
       fi
     fi
@@ -207,14 +220,16 @@ wait_for_generation() {
 }
 
 # True while the in-place restarts still look like recovery rather than a loop.
+# $1 is 1 to charge this restart to the budget and 0 to only age the history out —
+# see flux_restart_counts_against_budget for which restarts are worth charging.
 within_restart_budget() {
-  local now cutoff kept=()
+  local record="$1" now cutoff kept=()
   now="$(date -u +%s)"
   cutoff=$((now - FLUX_RESTART_WINDOW))
   for t in "${restart_history[@]}"; do
     [ "${t}" -ge "${cutoff}" ] && kept+=("${t}")
   done
-  kept+=("${now}")
+  [ "${record}" = "1" ] && kept+=("${now}")
   restart_history=("${kept[@]}")
   [ "${#restart_history[@]}" -le "${FLUX_RESTART_MAX_ATTEMPTS}" ]
 }
@@ -246,11 +261,17 @@ while true; do
     exit 42
   fi
 
-  if ! within_restart_budget; then
-    flux_log "${reason} — but that is ${#restart_history[@]} restarts within ${FLUX_RESTART_WINDOW}s. Something here is not fixable by restarting, so the container is ending instead and the platform can rebuild or move it (reporting 42)."
-    exit 42
+  if flux_restart_counts_against_budget "${reason}"; then
+    if ! within_restart_budget 1; then
+      flux_log "${reason} — but that is ${#restart_history[@]} restarts within ${FLUX_RESTART_WINDOW}s. Something here is not fixable by restarting, so the container is ending instead and the platform can rebuild or move it (reporting 42)."
+      exit 42
+    fi
+    budget="${#restart_history[@]}/${FLUX_RESTART_MAX_ATTEMPTS} within ${FLUX_RESTART_WINDOW}s"
+  else
+    within_restart_budget 0
+    budget="not counted against the ${FLUX_RESTART_MAX_ATTEMPTS}-in-${FLUX_RESTART_WINDOW}s budget; a rebuilt container would not fix this"
   fi
 
-  flux_log "${reason} — restarting the server in place (${#restart_history[@]}/${FLUX_RESTART_MAX_ATTEMPTS} within ${FLUX_RESTART_WINDOW}s), in ${FLUX_RESTART_BACKOFF}s"
+  flux_log "${reason} — restarting the server in place (${budget}), in ${FLUX_RESTART_BACKOFF}s"
   sleep "${FLUX_RESTART_BACKOFF}"
 done

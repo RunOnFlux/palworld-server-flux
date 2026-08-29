@@ -58,7 +58,34 @@ release (`vX.Y.Z` only, never `:latest`/`:dev`) when one appears. Needs
   ever seen). A subshell throws that away, and the uptime-went-backwards signal —
   which can only be seen by comparing two samples — is lost.
 - **A 401 is not a dead server.** Convicting on it restarts healthy worlds every
-  few minutes. Any new REST-derived rule has to sit behind the `auth_ok` gate.
+  few minutes. Any new REST-derived rule has to sit behind the `auth_ok` gate. The
+  one thing that convicts *because* of a 401 is the resident-memory collapse, and
+  only there: when the API does answer it knows more about the world than the
+  allocator does, so a server reporting fps must never be convicted by its memory.
+- **Three strikes are not the only speed.** `flux_worldless_is_proven` says when a
+  single sample already settles it (no serverfps plus either an uptime counter that
+  restarted or a collapse in resident memory), and that path also skips the
+  countdown — there is nobody in an unloaded world to announce to. Keep it pure,
+  keep it conjunctive: either half on its own convicts working servers. And it is
+  gated on `auth_ok`: behind a 401 the memory reading is all there is, so it
+  convicts but never on a single sample.
+- **The early wake in `flux_guard_wait` is an edge on purpose.** Resident memory
+  is watched through the wait between samples so a collapse does not sit unnoticed
+  for most of a minute, but a fall the full sample then calls healthy stays a fall
+  on every later glance. As a level it wakes every `FLUX_GUARD_RSS_POLL` seconds
+  forever, one REST call each: 15 wakes in 15 seconds with the edge removed. It is
+  also only armed while no verdict has strikes, so three strikes keeps meaning
+  three minutes.
+- **Not every restart is the container's fault.** `flux_restart_counts_against_budget`
+  keeps world unloads and the nightly reboot out of `FLUX_RESTART_MAX_ATTEMPTS`,
+  because ending the container costs a nine minute SteamCMD install and cannot fix
+  a game bug that only reproduces on one save. It matches on the leading word of
+  the reason string, which is why the guard's reason starts with the verdict.
+- **`flux_rest` trusts `%{http_code}` only when curl exited 0.** A server that
+  sends its headers and then stops leaves curl exiting 28 with the code already
+  set to 200 and an empty body — which reads as "answered, and reports no world",
+  turning a stalled server into a world unload. Wrong word, wrong announcement,
+  and now the wrong side of the restart budget.
 - **Never make the recovery path save.** A worldless server asked to save can
   write that emptiness over the last good save. The scheduled reboot saves only
   after confirming fps > 0.
@@ -76,7 +103,9 @@ release (`vX.Y.Z` only, never `:latest`/`:dev`) when one appears. Needs
   true in the image, and we do not set it — worth remembering before concluding a
   server should have been restarting.
 - The persistent volume is only `/palworld/Pal/Saved` (`containerData: g:/palworld/Pal/Saved`).
-  Anything written elsewhere is gone on redeploy.
+  Anything written elsewhere is gone on redeploy — and anything written *there* is
+  the customer's disk. `flux_prune_crash_dumps` is the only thing in here that
+  deletes: newest `FLUX_CRASH_KEEP` kept, `crashinfo-*` only, once per generation.
 
 ## Related
 

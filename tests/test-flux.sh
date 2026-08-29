@@ -63,6 +63,20 @@ check "401 with everything else fine" ok "$(flux_classify 0 0 0 "" "" 4940 0 655
 check "401 does not stop the socket check" stalled "$(flux_classify 0 0 0 "" "" 4940 110400 65536 1)"
 check "401 does not stop the save check" worldless "$(flux_classify 0 0 0 "" "" 4940 0 65536 0)"
 
+# ...and the hole that leaves. With the API refusing us, mode B has no symptom the
+# rules above can see: process up, socket drained, save file on disk. Resident
+# memory is the one signature left, so it is allowed to convict there and only
+# there — a server whose API is answering has better things to say about itself
+# than its allocator does.
+check "401 plus memory collapse is a world unload" \
+  worldless "$(flux_classify 0 0 0 "" "" 4940 0 65536 1 1)"
+check "memory collapse never overrules a server reporting fps" \
+  ok "$(flux_classify 1 1 1 59 5000 4940 0 65536 1 1)"
+check "memory collapse does not change a healthy 401 either way" \
+  ok "$(flux_classify 0 0 0 "" "" 4940 0 65536 1 0)"
+check "the argument is optional, as every caller before it assumed" \
+  ok "$(flux_classify 1 1 1 59 1200 1140 960 65536 1)"
+
 # The classifier is pure, which is what makes the table above possible — and is
 # also what let a rule that can never fire sit here passing for months. These
 # drive a whole run of samples through the same streak accounting the guard loop
@@ -103,6 +117,137 @@ check "an uptime reset alone never reaches three" \
 # And the case that must never convict: a healthy server, players or not.
 check "a healthy run never strikes" \
   0 "$(worldless_streak 65536 59:60 59:120 30:180 59:240 59:300)"
+
+# Which of those samples is worth acting on at once, and which wants confirming.
+# Getting this wrong in the permissive direction restarts working servers, so the
+# table below spells out every way a sample can fail to be proof.
+echo "flux_worldless_is_proven"
+proven() { if flux_worldless_is_proven "$@"; then printf yes; else printf no; fi; }
+# args: verdict fps uptime prev_uptime rss_dropped auth_ok
+
+# The incident sample itself: 1785894699157 at 04:30:23, uptime back to 34 from
+# 1600 with no serverfps behind a 200, on the same PID.
+check "no fps and the uptime counter restarted" yes "$(proven worldless "" 34 1600 0)"
+check "fps zero and the uptime counter restarted" yes "$(proven worldless 0 34 1600 0)"
+# The samples after it: the counter climbs again from its new base, so the edge is
+# gone and only the memory that left with the world still says so.
+check "no fps and memory gone, uptime climbing again" yes "$(proven worldless "" 95 34 1)"
+check "no fps, uptime climbing, memory intact" no "$(proven worldless "" 95 34 0)"
+
+# A working server, however it is dressed up.
+check "a server reporting fps is never proof" no "$(proven worldless 59 34 1600 1)"
+check "no previous sample to compare against" no "$(proven worldless "" 34 "" 0)"
+check "no uptime at all" no "$(proven worldless "" "" 1600 0)"
+check "uptime equal, not backwards" no "$(proven worldless "" 1600 1600 0)"
+# Only a world unload can be proven this way. A stalled socket or a dead API says
+# nothing about whether anyone is still connected, so both keep their countdown.
+check "stalled is never proven" no "$(proven stalled "" 34 1600 1)"
+check "unresponsive is never proven" no "$(proven unresponsive "" 34 1600 1)"
+check "ok is never proven" no "$(proven ok "" 34 1600 1)"
+
+# Behind a 401 the memory reading has nothing to be cross-checked against, so it
+# convicts the patient way and never the fast one. Three minutes costs nothing on
+# a server that has been unreachable for as long as its password has been wrong.
+check "memory alone is not proof when the API will not talk to us" \
+  no "$(proven worldless "" "" "" 1 0)"
+check "the same evidence with the API answering is proof" \
+  yes "$(proven worldless "" "" "" 1 1)"
+check "auth defaults to answering, as the guard always passes it" \
+  yes "$(proven worldless "" 34 1600 0)"
+
+echo "flux_rss_collapsed"
+collapsed() { if flux_rss_collapsed "$@"; then printf yes; else printf no; fi; }
+# args: rss peak, both in kB. Defaults: 1 GiB drop, 2 GiB minimum peak.
+# The real numbers, off the crash dumps: 3.2 GB peak, 1.05 GB at the crash.
+check "the drop from the crash dumps" yes "$(collapsed 1030908 3168996)"
+check "a peak that never got big enough to lose a gigabyte" no "$(collapsed 500000 1500000)"
+check "a drop just under the threshold" no "$(collapsed 2097153 3145728)"
+check "a drop exactly at the threshold" yes "$(collapsed 2097152 3145728)"
+check "memory at its peak" no "$(collapsed 3145728 3145728)"
+check "no reading at all is not a collapse" no "$(collapsed 0 3145728)"
+check "the signal can be switched off" no \
+  "$(FLUX_GUARD_RSS_DROP_KB=0 collapsed 1030908 3168996)"
+
+echo "flux_guard_wait"
+mkdir -p "${tmp}/proc/7777"
+rss_is() { printf 'VmRSS:\t %s kB\n' "$1" >"${tmp}/proc/7777/status"; }
+# Returns 0 on a normal wait and 1 when it came back early. Timed, because the
+# whole point is the wait it does not do.
+waited_for() {
+  local t0 t1
+  t0="$(date +%s)"
+  FLUX_PROC_ROOT="${tmp}/proc" FLUX_GUARD_INTERVAL="$1" FLUX_GUARD_RSS_POLL="$2" \
+    flux_guard_wait "$3" 7777 "${4:-3168996}" >/dev/null
+  local rc=$?
+  t1="$(date +%s)"
+  printf '%s after %ss' "$([ "${rc}" = 0 ] && printf full || printf early)" "$((t1 - t0))"
+}
+rss_is 3168996
+check "memory holding up waits the whole interval" "full after 3s" "$(waited_for 3 1 1)"
+rss_is 1030908
+check "a collapse cuts the wait short" "early after 1s" "$(waited_for 6 1 1)"
+check "and is ignored when the wake is not armed" "full after 2s" "$(waited_for 2 1 0)"
+check "a poll at or above the interval is just a sleep" "full after 1s" "$(waited_for 1 5 1)"
+check "polling can be switched off entirely" "full after 1s" "$(waited_for 1 0 1)"
+# The signal itself off means there is nothing to wake on, however fast we look.
+check "no memory signal, no early wake" "full after 2s" \
+  "$(FLUX_GUARD_RSS_DROP_KB=0 waited_for 2 1 1)"
+# A world that never grew big enough to lose a gigabyte cannot produce a collapse,
+# so the wait must not spend a single read looking for one.
+check "a peak too small to fall from is a plain sleep" "full after 2s" \
+  "$(waited_for 2 1 1 1500000)"
+check "and so is a generation with no peak yet" "full after 2s" \
+  "$(waited_for 2 1 1 0)"
+
+echo "flux_game_rss_kb"
+mkdir -p "${tmp}/proc/4242"
+printf 'Name:\tPalServer-Lin\nVmPeak:\t 7344700 kB\nVmRSS:\t 3168996 kB\nThreads:\t 42\n' \
+  >"${tmp}/proc/4242/status"
+check "reads VmRSS for a pid" 3168996 "$(FLUX_PROC_ROOT=${tmp}/proc flux_game_rss_kb 4242)"
+check "a pid with no status file reads zero" 0 "$(FLUX_PROC_ROOT=${tmp}/proc flux_game_rss_kb 9999)"
+
+echo "flux_times"
+check "one sample" once "$(flux_times 1)"
+check "three samples" "3 times" "$(flux_times 3)"
+
+echo "flux_restart_counts_against_budget"
+counts() { if flux_restart_counts_against_budget "$1"; then printf yes; else printf no; fi; }
+# Ending the container costs a full SteamCMD install — 9m08s on the log this came
+# from — and hands the app back to the platform's 30s loop. It has to be spent on
+# the failures a fresh container could actually fix.
+check "a world unload is the restart working, not the container failing" \
+  no "$(counts 'worldless confirmed once (rest=200 metrics=1 fps=- uptime=34)')"
+check "the nightly reboot is not a failure at all" \
+  no "$(counts 'scheduled restart')"
+check "the same, when it had to force the shutdown" \
+  no "$(counts 'scheduled restart (server ignored the shutdown request)')"
+check "a stalled socket still counts" \
+  yes "$(counts 'stalled confirmed 3 times (rest=200 rxq=110400)')"
+check "a dead REST API still counts" \
+  yes "$(counts 'unresponsive confirmed 3 times (rest=000)')"
+check "a server exiting on its own still counts" \
+  yes "$(counts 'the server ended on its own (exit 0)')"
+
+echo "flux_prune_crash_dumps"
+FLUX_CRASH_DIR="${tmp}/Crashes"
+mkdir -p "${FLUX_CRASH_DIR}"
+for i in 1 2 3 4 5; do
+  mkdir -p "${FLUX_CRASH_DIR}/crashinfo-Pal-pid-${i}/files"
+  touch "${FLUX_CRASH_DIR}/crashinfo-Pal-pid-${i}/files/Diagnostics.txt"
+  touch -d "2026-08-2${i} 04:00:00" "${FLUX_CRASH_DIR}/crashinfo-Pal-pid-${i}"
+done
+# Something that is not a dump. The volume is the customer's and this function
+# deletes; it only ever deletes what the engine named.
+mkdir -p "${FLUX_CRASH_DIR}/not-a-dump"
+check "counts what is there" 6 "$(flux_crash_dump_count)"
+check "keeping zero prunes nothing" 6 "$(FLUX_CRASH_KEEP=0 flux_prune_crash_dumps >/dev/null; flux_crash_dump_count)"
+there() { if [ -d "${FLUX_CRASH_DIR}/$1" ]; then printf yes; else printf no; fi; }
+check "keeps the newest two" 3 "$(FLUX_CRASH_KEEP=2 flux_prune_crash_dumps >/dev/null; flux_crash_dump_count)"
+check "and they are the newest two" yes-yes "$(there crashinfo-Pal-pid-5)-$(there crashinfo-Pal-pid-4)"
+check "the oldest are gone" no-no "$(there crashinfo-Pal-pid-1)-$(there crashinfo-Pal-pid-3)"
+check "anything that is not a dump is left alone" yes "$(there not-a-dump)"
+check "a missing directory is not an error" 0 \
+  "$(FLUX_CRASH_DIR=${tmp}/nope flux_prune_crash_dumps >/dev/null; echo $?)"
 
 echo "flux_boot_phase"
 # args: installed pid_present

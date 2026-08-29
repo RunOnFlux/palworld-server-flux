@@ -51,9 +51,30 @@ before it believes it. The full decision table is unit tested in
 | verdict | when |
 | --- | --- |
 | `stalled` | the game's UDP receive queue is at or above `FLUX_GUARD_RXQ_BYTES` (mode A, the socket half) |
-| `unresponsive` | `/v1/api/info` stopped answering (mode A, the API half) |
-| `worldless` | the API answers but `/v1/api/metrics` does not, or answers without a readable `serverfps`, or reports 0 fps, or its uptime counter went **backwards**, or the world save vanished from disk (mode B) |
+| `unresponsive` | `/v1/api/info` stopped answering (mode A, the API half). A reply `curl` could not finish counts as no answer, headers or not — a server that sends its status line and then stops is stalled, not worldless |
+| `worldless` | the API answers but `/v1/api/metrics` does not, or answers without a readable `serverfps`, or reports 0 fps, or its uptime counter went **backwards**, or the world save vanished from disk, or — when a 401 has blinded every rule above — resident memory has collapsed from this generation's peak (mode B) |
 | `ok` | none of the above |
+
+**Except when one sample already settles it.** Three strikes are right for
+evidence that might be a bad minute; they are dead weight against a server that
+has demonstrably lost its world. No serverfps *and* an uptime counter that
+restarted cannot happen to a working server, and neither can no serverfps *and*
+the gigabytes the world occupied handed back to the kernel. Either pair is acted
+on at the first sample, and skips the countdown below with it — there is nobody
+in a world that does not exist to warn. Everything else keeps all three strikes
+and the full minute, **including the memory signal behind a 401**: there, memory
+is the only thing we have and there is nothing left to cross-check one reading
+against, so it convicts the patient way. The rule is `flux_worldless_is_proven`,
+and it is pure and unit tested like the table above.
+
+It is worth what it costs. On `palworld1785894699157` — 41 hours, a world that
+died 28 times — the patient path took a median 4m50s from the world going to the
+server being playable again, of which three minutes were strikes two and three
+plus a countdown announced to an empty world. Five of those 28 had a player
+reconnect within 1.0 to 1.5 minutes, and they only got in because the process had
+*also* segfaulted and skipped our slow path. On a sixth (10:15:47) the player came
+back 1m57s after the world went, and the patient path would still have been
+counting.
 
 Three things it deliberately will not do:
 
@@ -71,15 +92,33 @@ Three things it deliberately will not do:
   emptiness over the customer's last good save. What a kill costs is the interval
   since the last autosave, which was lost the moment the fault happened.
 
-Once it has decided, it does not pull the trigger immediately: it announces the
-restart in game and counts down `FLUX_GUARD_RESTART_DELAY` seconds (60 by
-default), with reminders at 30 and 10 seconds left, and then takes one last
-sample. A server that came back during the countdown is left alone and the
-countdown is called off, out loud. The warning is best effort by design — in most
-of these states there is nobody left to warn, because mode B has already dropped
-every player and a stalled server cannot be asked to announce anything — but it
-costs one REST call to try, and the wait doubles as the last chance for a server
-that is recovering to say so.
+Once it has decided — on anything but the proven world loss above — it does not
+pull the trigger immediately: it announces the restart in game and counts down
+`FLUX_GUARD_RESTART_DELAY` seconds (60 by default), with reminders at 30 and 10
+seconds left, and then takes one last sample. A server that came back during the
+countdown is left alone and the countdown is called off, out loud. The warning is
+best effort by design — in most of these states there is nobody left to warn,
+because mode B has already dropped every player and a stalled server cannot be
+asked to announce anything — but it costs one REST call to try, and the wait
+doubles as the last chance for a server that is recovering to say so.
+
+What is left of the delay is the wait between samples, and half a sample interval
+is a long time to have spent doing nothing. Asking the REST API more often is not
+free — the game writes a line into its own console for every call, which is why it
+is rationed to one a minute — but memory is: a read from `/proc` the game never
+sees. So it is glanced at every `FLUX_GUARD_RSS_POLL` seconds throughout the wait,
+and a collapse brings the next full sample forward from up to a minute away to a
+few seconds. Detection stops averaging thirty seconds and starts averaging five.
+
+The glance never decides anything; it only moves the sample that does. Two rules
+keep it from becoming a way to restart a healthy server. It is **only armed while
+nothing is already suspected** — inside a strike run the cadence is untouched,
+because three strikes has to go on meaning three minutes rather than fifteen
+seconds. And it is an **edge, not a level**: memory really can be handed back for
+benign reasons, and a fall the full sample then calls healthy must not wake the
+guard again five seconds later and every five seconds after that. Left as a level
+it costs a REST call a second — measured, with the edge removed: 15 wakes in 15
+seconds. One wake per fall, re-armed only when a sample sees memory back up.
 
 `flux-guard.sh --check` runs one sample and exits non-zero when unhealthy. That is
 also the image's `HEALTHCHECK`, replacing `pgrep`, so `docker inspect` finally
@@ -159,6 +198,18 @@ seconds, the supervisor stops trying and exits, because a server that cannot sta
 up needs rebuilding or moving, not restarting again. `FLUX_RESTART_MODE=container`
 skips the supervision entirely and ends the container on every restart.
 
+Not every restart is charged to that budget, though, because rebuilding is not
+free: a new container means a full SteamCMD install, nine minutes and eight
+seconds of it on the log this rule came from, and then a wait on the platform loop
+described below. That price buys something real against a server that cannot stay
+up — clean disk, possibly a different node. It buys nothing against a bug in the
+game that only reproduces on this customer's save, where the world would unload on
+the new container too. So a `worldless` restart, which the in-place restart fixed
+28 times out of 28, and the nightly reboot, which is not a failure at all, are
+logged and not counted. Everything else counts exactly as it did. A worldless
+server that *doesn't* come back is caught a step earlier: the guard never convicts
+a server it has not seen healthy since boot, so it never restarts one either.
+
 When it does end the container, it exits **42** rather than 0, so a deliberate
 restart is on the record and cannot be read as a clean stop. What happens then is
 the platform's business:
@@ -189,19 +240,23 @@ Everything upstream supports works unchanged. On top of it:
 | --- | --- | --- |
 | `FLUX_GUARD_ENABLED` | `true` | run the probe at all |
 | `FLUX_GUARD_INTERVAL` | `60` | seconds between samples |
-| `FLUX_GUARD_FAILURES` | `3` | consecutive bad samples before acting |
+| `FLUX_GUARD_RSS_POLL` | `5` | seconds between glances at resident memory while waiting for the next sample; a collapse cuts the wait short, `0` disables it |
+| `FLUX_GUARD_FAILURES` | `3` | consecutive bad samples before acting (a proven world loss acts on the first) |
 | `FLUX_GUARD_RXQ_BYTES` | `65536` | UDP receive queue that counts as stalled (a healthy server peaks around 17 KB; the frozen ones sat at 90 to 110 KB) |
-| `FLUX_GUARD_MIN_UPTIME` | `300` | seconds after boot during which nothing is acted on |
-| `FLUX_GUARD_RESTART_DELAY` | `60` | seconds between deciding and acting, announced in game |
+| `FLUX_GUARD_MIN_UPTIME` | `300` | seconds into a generation during which nothing is acted on |
+| `FLUX_GUARD_RSS_DROP_KB` | `1048576` | fall in resident memory from this generation's peak that reads as the world unloading; `0` switches the signal off |
+| `FLUX_GUARD_RSS_MIN_PEAK_KB` | `2097152` | peak the process must have reached before that fall is believed |
+| `FLUX_GUARD_RESTART_DELAY` | `60` | seconds between deciding and acting, announced in game (skipped on a proven world loss) |
 | `FLUX_GUARD_BODY_CHARS` | `240` | how much of the metrics body to quote in the log on the first bad sample |
 | `FLUX_GUARD_DRY_RUN` | `false` | log the verdict and never act |
 | `FLUX_RESTART_MODE` | `process` | `process` restarts the server inside the container; `container` ends the container and lets the platform rebuild it |
-| `FLUX_RESTART_MAX_ATTEMPTS` | `5` | in-place restarts allowed inside the window before the container ends instead |
+| `FLUX_RESTART_MAX_ATTEMPTS` | `5` | in-place restarts allowed inside the window before the container ends instead; world unloads and the nightly reboot are not counted |
 | `FLUX_RESTART_WINDOW` | `3600` | seconds the attempt count looks back over |
 | `FLUX_RESTART_BACKOFF` | `10` | seconds between generations |
 | `FLUX_RESTART_GRACE` | `60` | seconds a requested restart may spend winding down before the supervisor forces it |
 | `FLUX_REBOOT_GRACEFUL_WAIT` | `90` | seconds the scheduled restart waits for the server to shut itself down |
 | `FLUX_GUARD_LOG` | `/palworld/Pal/Saved/flux-guard.log` | persistent log, capped at 2000 lines |
+| `FLUX_CRASH_KEEP` | `20` | crash dumps kept on the volume; the rest are deleted once per generation, `0` keeps them all |
 
 The log is written to the app volume on purpose: it is the only copy that survives
 the restart it describes, and the customer can read it from the dashboard's file
@@ -222,19 +277,29 @@ reads like this:
 
 ```
 [flux] starting the server (generation 1)
-[flux] guard armed: every 60s, 3 strikes, rxq limit 65536 bytes, min uptime 300s, dry_run=false
+[flux] guard armed: every 60s (memory watched every 5s), 3 strikes (1 when the world loss is proven), rxq limit 65536 bytes, rss drop 1024M, min uptime 300s, dry_run=false
 [flux] server healthy for the first time this boot (rest=200 metrics=1 fps=59 uptime=600 ...)
-[flux] worldless 1/3 (rest=200 metrics=1 fps=unreadable players=- uptime=12 prev_uptime=600 rxq=0 save=1 pid=26)
+[flux] worldless 1/1 (rest=200 metrics=1 fps=unreadable players=- uptime=12 prev_uptime=600 rxq=0 save=1 rss=1031M peak=3169M pid=26)
 [flux]   metrics said: <the first 240 characters of whatever the server replied>
-[flux] worldless 2/3 (...)
-[flux] worldless 3/3 (...)
-[flux] ACTION worldless confirmed 3 times (...); warning players and restarting in 60s
-[flux] RESTART requested: worldless confirmed 3 times (...)
+[flux] ACTION worldless confirmed once (...); the world is provably gone, so there is nobody to warn — restarting now
+[flux] RESTART requested: worldless confirmed once (...)
 [flux] sending SIGKILL to PalServer-Linux-Shipping (pid 26)
-[flux] worldless confirmed 3 times (...) — restarting the server in place (1/5 within 3600s), in 10s
+[flux] worldless confirmed once (...) — restarting the server in place (not counted against the 5-in-3600s budget; a rebuilt container would not fix this), in 10s
 [flux] starting the server (generation 2)
 [flux] server healthy for the first time this boot (rest=200 metrics=1 fps=59 ...)
 ```
+
+Evidence that is not proof — a missing `serverfps` on its own, a stalled socket, a
+dead API — reads the way it always did: `worldless 1/3`, `2/3`, `3/3`, then
+`warning players and restarting in 60s`, then one last sample that can still call
+the whole thing off.
+
+Every generation also logs how many crash dumps the game has left under
+`Pal/Saved/Crashes`, and how many are new since the last one. It is the only crash
+telemetry the engine gives us, it survives container rebuilds and node moves, and
+it is what says whether a world has been crashing for weeks or started today.
+Nothing used to delete them, on the one directory the customer pays to keep, so
+the newest `FLUX_CRASH_KEEP` are kept and the rest go once per generation.
 
 ## Build and test
 
@@ -248,11 +313,20 @@ docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable -x scripts/*.s
 `tests/test-entrypoint.sh` stands a fake Palworld in front of the guard — a
 process with the right name and the two REST endpoints served from a file — and
 then makes the world disappear underneath it, which is the mode B signature from
-the ticket. It asserts that the players are warned, that the server is replaced in
-place, that the container never ended, and that the replacement comes up healthy;
-plus that a server which recovers mid-countdown is spared, that `docker stop` is
-never followed by a restart, and that a server which will not stay up stops being
-restarted. No five gigabyte download involved.
+the ticket. It asserts that a proven world loss is acted on at the first sample
+with no countdown, that the server is replaced in place, that the container never
+ended, and that the replacement comes up healthy; plus that unproven evidence
+still waits and still warns, that a server which recovers mid-countdown is spared,
+that repeated world unloads never end the container however low the restart budget
+is set, that `docker stop` is never followed by a restart, and that a server which
+will not stay up stops being restarted. No five gigabyte download involved.
+
+The stub also drives the states a metrics file cannot describe, through a `/proc`
+the test can write to and two flag files: a world that unloads **without** moving
+the uptime counter, where only the memory collapse is left to catch it; the same
+unload behind a 401, which must convict but never on one sample; and a server that
+sends its headers and then stops, which must read as `unresponsive` rather than as
+a world unload. That last one fails against the code as it was.
 
 ## Releases
 

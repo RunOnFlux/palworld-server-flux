@@ -28,9 +28,10 @@ FLUX_INIT_PIDFILE="${FLUX_INIT_PIDFILE:-/tmp/flux-init.pid}"
 FLUX_RESTART_MARKER="${FLUX_RESTART_MARKER:-/tmp/flux-restart-requested}"
 
 FLUX_GAME_PROCESS="${FLUX_GAME_PROCESS:-PalServer-Linux-Shipping}"
-# Overridable so the tests can feed the parser a fixture instead of the kernel.
+# Overridable so the tests can feed the parsers a fixture instead of the kernel.
 FLUX_PROC_UDP="${FLUX_PROC_UDP:-/proc/net/udp}"
 FLUX_PROC_UDP6="${FLUX_PROC_UDP6:-/proc/net/udp6}"
+FLUX_PROC_ROOT="${FLUX_PROC_ROOT:-/proc}"
 FLUX_REST_TIMEOUT="${FLUX_REST_TIMEOUT:-10}"
 
 # --- logging ----------------------------------------------------------------
@@ -128,7 +129,7 @@ flux_rest_is_post() {
 # credentials are wrong" (401) are opposite verdicts, and a caller that had to
 # reach for "$(flux_rest ...)" would run this in a subshell and lose the code.
 flux_rest() {
-  local path="$1" data="${2:-}" pw out code
+  local path="$1" data="${2:-}" pw out code rc
   FLUX_REST_BODY=""
   FLUX_REST_CODE="000"
   # shellcheck disable=SC2119
@@ -136,12 +137,30 @@ flux_rest() {
   if [ -n "${data}" ] || flux_rest_is_post "${path}"; then
     out=$(curl -sS -m "${FLUX_REST_TIMEOUT}" -u "admin:${pw}" -w $'\n%{http_code}' \
       -X POST --json "${data}" "http://127.0.0.1:${REST_API_PORT:-8212}/v1/api/${path}" 2>/dev/null)
+    rc=$?
   else
     out=$(curl -sS -m "${FLUX_REST_TIMEOUT}" -u "admin:${pw}" -w $'\n%{http_code}' \
       -H 'Accept: application/json' "http://127.0.0.1:${REST_API_PORT:-8212}/v1/api/${path}" 2>/dev/null)
+    rc=$?
   fi
   code="${out##*$'\n'}"
   [[ "${code}" =~ ^[0-9]{3}$ ]] || code="000"
+
+  # A reply curl could not finish is not a reply, whatever status line came with
+  # it. This is not theoretical: a server that sends its headers and then stops —
+  # which is what a wedged game thread looks like from here — leaves curl exiting
+  # 28 with %{http_code} already set to 200, and an empty body behind it. Read
+  # literally that is "the API answered 200 and reported no world", so a stalled
+  # server was diagnosed as a world unload: the wrong word in the log, the wrong
+  # sentence announced to the players, and now the wrong side of the restart
+  # budget, since a world unload is deliberately never charged to it. 000 is what
+  # this actually is, and it is what every other kind of no-answer already reports.
+  # An HTTP status curl delivered in full — 401, 404, 500 — still comes through:
+  # those are answers, and curl exits 0 for all of them.
+  if [ "${rc}" -ne 0 ]; then
+    code="000"
+    out=""
+  fi
   # Both are read by the other scripts, which shellcheck cannot see from here.
   # shellcheck disable=SC2034
   FLUX_REST_CODE="${code}"
@@ -178,6 +197,112 @@ flux_json_num() {
 # --- system probes ----------------------------------------------------------
 flux_game_pid() { pgrep -f "${FLUX_GAME_PROCESS}" 2>/dev/null | head -1; }
 
+# Resident memory of the game process, in kB, straight out of /proc. Prints 0
+# when there is no process to ask, which every caller reads as "no reading", not
+# as "zero bytes".
+#
+# This is the signature the README has always described for both failure modes and
+# the one thing the probe never actually measured. Mode B takes gigabytes with it:
+# in all five crash dumps from 1785894699157 the process was down to 1.05 GB
+# against a peak of 3.2 GB, which is to say the world had already unloaded before
+# the segfault that produced the dump. The number costs one small read per minute.
+# Parsed in the shell rather than with awk on purpose. flux_guard_wait calls this
+# every few seconds rather than every minute, and a fork per glance is a poor way
+# to pay for something advertised as free.
+flux_game_rss_kb() {
+  local pid="${1:-}" key value
+  [ -n "${pid}" ] || pid="$(flux_game_pid)"
+  [ -n "${pid}" ] || { printf '0'; return; }
+  while read -r key value _; do
+    if [ "${key}" = "VmRSS:" ]; then
+      printf '%s' "${value}"
+      return
+    fi
+  done 2>/dev/null <"${FLUX_PROC_ROOT}/${pid}/status"
+  printf '0'
+}
+
+# How far resident memory has to fall below this generation's own peak before the
+# fall means the world went away rather than the allocator breathing. A gigabyte
+# is what the README observed and is far outside anything a loaded world does.
+FLUX_GUARD_RSS_DROP_KB="${FLUX_GUARD_RSS_DROP_KB:-1048576}"
+# ...and how big the peak must have been for the drop to be worth believing. A
+# server whose world never occupied two gigabytes cannot lose one of them, and
+# rather than guess about small worlds the signal simply switches itself off.
+FLUX_GUARD_RSS_MIN_PEAK_KB="${FLUX_GUARD_RSS_MIN_PEAK_KB:-2097152}"
+
+# Pure. True when this reading, against the highest one seen in this generation,
+# is a collapse rather than normal movement. Setting FLUX_GUARD_RSS_DROP_KB=0
+# turns the whole signal off.
+#   $1 rss   current reading in kB, 0 when unknown
+#   $2 peak  highest reading this generation, in kB
+flux_rss_collapsed() {
+  local rss="${1:-0}" peak="${2:-0}"
+  [ "${FLUX_GUARD_RSS_DROP_KB}" -gt 0 ] || return 1
+  [ "${rss}" -gt 0 ] || return 1
+  [ "${peak}" -ge "${FLUX_GUARD_RSS_MIN_PEAK_KB}" ] || return 1
+  [ "$((peak - rss))" -ge "${FLUX_GUARD_RSS_DROP_KB}" ]
+}
+
+# How often to glance at resident memory while waiting for the next full sample.
+# 0 disables the early wake and leaves the guard on a plain fixed cadence.
+FLUX_GUARD_RSS_POLL="${FLUX_GUARD_RSS_POLL:-5}"
+
+# The gap between two full samples. Normally just a sleep.
+#
+# Resident memory is the only signal here that costs nothing to look at: a read
+# from /proc, invisible to the game, where every REST call writes a line into the
+# server's own console and is therefore rationed to one a minute. So during the
+# wait it is glanced at every FLUX_GUARD_RSS_POLL seconds, and a collapse cuts the
+# wait short. Detection stops being an average of half the sample interval and
+# becomes a few seconds.
+#
+# It never decides anything. All it does is bring forward the full sample that
+# was going to run at the end of the wait anyway, and that sample is judged by
+# exactly the same rules it always was. Two things keep it honest, and both are
+# the caller's to pass in:
+#
+#   - it is only ever armed when the guard currently believes the server is fine.
+#     Inside a strike run the cadence is left alone, because three strikes has to
+#     go on meaning three minutes rather than fifteen seconds.
+#   - it is an edge, not a level. A collapse that the full sample then calls
+#     healthy — memory really can be handed back for benign reasons — must not
+#     wake us again five seconds later, and again, forever: that would be a REST
+#     call every five seconds for the life of the generation. The caller disarms
+#     on the wake and only re-arms when a sample sees memory back above the line.
+#
+# $1  1 when an early wake is armed, anything else to just wait
+# $2  pid to watch, empty to look one up
+# $3  highest resident memory seen this generation, in kB
+# Returns 0 on a normal wait, 1 when it came back early.
+flux_guard_wait() {
+  local armed="$1" pid="$2" peak="$3" waited=0 step rss
+  step="${FLUX_GUARD_RSS_POLL}"
+  # Nothing to watch for: not armed, polling off or slower than the interval, the
+  # signal switched off, or a generation whose world never grew big enough to lose
+  # a gigabyte. Bail before the loop rather than inside it, so a server this can
+  # never fire on does not pay a single extra read for it.
+  if [ "${armed}" != "1" ] || [ "${step}" -le 0 ] 2>/dev/null || \
+     [ "${step}" -ge "${FLUX_GUARD_INTERVAL}" ] || \
+     [ "${FLUX_GUARD_RSS_DROP_KB}" -le 0 ] || \
+     [ "${peak:-0}" -lt "${FLUX_GUARD_RSS_MIN_PEAK_KB}" ]; then
+    sleep "${FLUX_GUARD_INTERVAL}"
+    return 0
+  fi
+
+  while [ "${waited}" -lt "${FLUX_GUARD_INTERVAL}" ]; do
+    [ $((waited + step)) -gt "${FLUX_GUARD_INTERVAL}" ] && step=$((FLUX_GUARD_INTERVAL - waited))
+    sleep "${step}"
+    waited=$((waited + step))
+    rss="$(flux_game_rss_kb "${pid}")"
+    if flux_rss_collapsed "${rss}" "${peak}"; then
+      flux_log "resident memory fell to $((rss / 1024))M from this generation's peak of $((peak / 1024))M; sampling now rather than in $((FLUX_GUARD_INTERVAL - waited))s"
+      return 1
+    fi
+  done
+  return 0
+}
+
 # Bytes sitting unread in the receive queue of the game's UDP socket, straight
 # out of /proc (no ss/netstat in the image). A healthy server drains this every
 # tick and it reads a few KB at most; a frozen game thread lets it climb and
@@ -205,6 +330,33 @@ flux_crash_dump_count() {
   local n
   n=$(find "${FLUX_CRASH_DIR}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
   printf '%s' "${n:-0}"
+}
+
+# How many to keep. Nothing has ever deleted these: they land on the one directory
+# that survives a redeploy, which is the customer's paid storage, and a world that
+# crashes the way 1785894699157 does adds five a day forever. 0 disables pruning.
+FLUX_CRASH_KEEP="${FLUX_CRASH_KEEP:-20}"
+
+# Deletes all but the newest FLUX_CRASH_KEEP dumps. Called once per generation,
+# where it costs one directory listing on a directory that holds tens of entries.
+#
+# Only ever touches directories named the way the engine names them, and only
+# inside FLUX_CRASH_DIR. The newest are what anyone would look at; the count that
+# came before the prune is logged, so what is lost is the dumps, not the record
+# that this world has been crashing.
+flux_prune_crash_dumps() {
+  local keep="${FLUX_CRASH_KEEP}" removed=0 dir
+  [ "${keep}" -gt 0 ] 2>/dev/null || return 0
+  [ -n "${FLUX_CRASH_DIR}" ] && [ -d "${FLUX_CRASH_DIR}" ] || return 0
+
+  while IFS= read -r dir; do
+    [ -n "${dir}" ] || continue
+    rm -rf -- "${dir}" 2>/dev/null && removed=$((removed + 1))
+  done < <(find "${FLUX_CRASH_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'crashinfo-*' \
+    -printf '%T@\t%p\n' 2>/dev/null | sort -rn | tail -n "+$((keep + 1))" | cut -f2-)
+
+  [ "${removed}" -gt 0 ] && flux_log "pruned ${removed} old crash dump(s) from ${FLUX_CRASH_DIR}, keeping the newest ${keep}"
+  return 0
 }
 
 # --- boot phase -------------------------------------------------------------
@@ -277,11 +429,14 @@ flux_save_present() {
 #   $7 rxq          bytes queued on the game's UDP socket
 #   $8 rxq_limit    threshold for the queue
 #   $9 save_present 1/0, from flux_save_present
+#  $10 rss_dropped  1 when resident memory has collapsed from this generation's
+#                       peak, from flux_rss_collapsed. Optional; absent reads as 0
 #
 # Prints one of: ok | stalled | unresponsive | worldless
 flux_classify() {
   local auth_ok="$1" info_ok="$2" metrics_ok="$3" fps="$4" uptime="$5" \
-    prev_uptime="$6" rxq="$7" rxq_limit="$8" save_present="$9"
+    prev_uptime="$6" rxq="$7" rxq_limit="$8" save_present="$9" \
+    rss_dropped="${10:-0}"
 
   # Mode A, the socket half. Checked first and without auth: it is the one signal
   # that is true even when the REST API is answering happily.
@@ -292,6 +447,21 @@ flux_classify() {
 
   # A save that was there and is not there any more. No auth needed either.
   if [ "${save_present}" = "0" ]; then
+    printf 'worldless'
+    return
+  fi
+
+  # Mode B seen from outside the REST API, and the only rule that can see it at
+  # all when our credentials are refused. A 401 blinds every rule below it, and
+  # the two rules above are no help: in mode B the process is up, the socket is
+  # drained and the save file is still on disk, so a server whose world has gone
+  # reads as perfectly healthy for as long as the password stays wrong.
+  #
+  # Deliberately gated on the credentials rather than applied everywhere: when the
+  # API does answer it says more about the world than memory ever can, and a
+  # server reporting fps above zero has no business being convicted by its
+  # allocator. This is the hole, and only the hole.
+  if [ "${auth_ok}" != "1" ] && [ "${rss_dropped}" = "1" ]; then
     printf 'worldless'
     return
   fi
@@ -340,14 +510,72 @@ flux_classify() {
 
   # An edge, and deliberately kept as one: the counter drops once and then climbs
   # again from its new base, so this can only ever fire on a single sample and can
-  # never reach FLUX_GUARD_FAILURES on its own. It earns its place by naming the
-  # moment the world went away in the log; the rule above is what acts on it.
+  # never reach FLUX_GUARD_FAILURES on its own. It earns its place twice over —
+  # it names the moment the world went away in the log, and together with a
+  # missing serverfps it is what flux_worldless_is_proven acts on immediately.
   if [ -n "${uptime}" ] && [ -n "${prev_uptime}" ] && [ "${uptime}" -lt "${prev_uptime}" ]; then
     printf 'worldless'
     return
   fi
 
   printf 'ok'
+}
+
+# Pure. True when a single sample is already proof that the world is gone, rather
+# than evidence that wants confirming.
+#
+# The distinction buys back three minutes of a five minute recovery. Waiting for
+# three strikes and then warning the players for another minute is right for a
+# server that might be having a bad moment; it is dead weight for one that has
+# demonstrably lost its world, and the log from 1785894699157 shows the cost. Over
+# 41 hours that world died 28 times and came back to a player within one to two
+# minutes on five of them — each time only because the process had also crashed
+# and skipped our slow path. On the sixth (10:15:47) the player reconnected 1m57s
+# after the world went, and the patient path would still have been counting.
+#
+# Nothing here can be true of a working server:
+#   $1 verdict      from flux_classify; anything but worldless is never proof
+#   $2 fps          a loaded world always answers with a usable serverfps
+#   $3 uptime       )  the server's own counter, which only a new world restarts
+#   $4 prev_uptime  )
+#   $5 rss_dropped  the gigabytes the world occupied have gone back to the kernel
+#   $6 auth_ok      whether the REST API is talking to us at all
+flux_worldless_is_proven() {
+  local verdict="$1" fps="$2" uptime="$3" prev_uptime="$4" rss_dropped="${5:-0}" \
+    auth_ok="${6:-1}"
+
+  [ "${verdict}" = "worldless" ] || return 1
+
+  # Acting on one sample is only safe while the server is still answering us.
+  # Behind a 401 the memory reading is the single thing we have and there is
+  # nothing to cross-check it against, so it is allowed to convict — that is the
+  # hole it was added to close — but only the patient way, with three samples and
+  # a countdown. Three minutes is nothing against a server that has been
+  # unreachable for as long as its password has been wrong.
+  [ "${auth_ok}" = "1" ] || return 1
+
+  # Everything below describes a server that will not give us a working serverfps.
+  # On its own that is not proof — one unlucky sample can lose the field — which
+  # is exactly why it has to be joined by one of the two signals after it.
+  { [ -z "${fps}" ] || [ "${fps}" -eq 0 ]; } || return 1
+
+  # Proof one: the uptime counter restarted. A server does not un-age. The only
+  # thing that resets it is a world that is not the world we were watching, and
+  # the same PID in the evidence line says nobody restarted the process for us.
+  if [ -n "${uptime}" ] && [ -n "${prev_uptime}" ] && [ "${uptime}" -lt "${prev_uptime}" ]; then
+    return 0
+  fi
+
+  # Proof two: the memory the world lived in went back to the kernel. Slower to
+  # arm than the uptime edge (it needs a peak to compare against) but it is a
+  # level rather than an edge, so it still holds on the samples after the one
+  # where the counter jumped — which is what covers a sample lost to a timeout.
+  [ "${rss_dropped}" = "1" ]
+}
+
+# "once" / "3 times", so a log line about a single sample reads like English.
+flux_times() {
+  if [ "${1:-}" = "1" ]; then printf 'once'; else printf '%s times' "${1:-0}"; fi
 }
 
 # --- seeding a brand new server's settings file ----------------------------
@@ -496,4 +724,39 @@ flux_force_restart() {
   else
     flux_log "no ${FLUX_GAME_PROCESS} process found; this generation is already on its way out"
   fi
+}
+
+# --- what a restart says about the container ---------------------------------
+# Pure. True when this restart is evidence that something here is wrong in a way
+# a fresh container might fix, and so is allowed to count against
+# FLUX_RESTART_MAX_ATTEMPTS and eventually end the container.
+#
+# Not every restart is that. Ending the container costs a full SteamCMD install —
+# nine minutes and eight seconds on 1785894699157, measured — and hands the app to
+# the platform's 30 second masterSlaveApps loop on the way back. That price is
+# worth paying for a server that cannot stay up, because a rebuild moves it to
+# clean disk and possibly a different node. It buys nothing at all against a bug
+# in the game that only reproduces on this customer's save: the world would unload
+# on the new container too, and we would have traded a 90 second restart for a
+# nine minute one. That same log reached 3 of 5 in an hour twice; a world dying
+# every 27 minutes while idle gets to 5 without trying.
+#
+# So the budget is spent only on the failures a rebuild has any claim on:
+#
+#   worldless          the in-place restart IS the fix, and it worked 28/28 times.
+#                      A worldless server that does not come back is caught by the
+#                      guard's own "not been healthy once since boot" hold, which
+#                      never convicts and so never restarts anything.
+#   scheduled restart  not a failure at all. Charging the nightly reboot one of
+#                      five was always wrong.
+#   everything else    the leak, a dead REST API, a server exiting on its own —
+#                      counted, exactly as before.
+#
+# $1 the reason string flux-entrypoint.sh is about to log.
+flux_restart_counts_against_budget() {
+  case "$1" in
+    worldless*)           return 1 ;;
+    "scheduled restart"*) return 1 ;;
+    *)                    return 0 ;;
+  esac
 }
