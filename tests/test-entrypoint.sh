@@ -230,6 +230,20 @@ if run_stub linger; then
   check "and nothing was restarted afterwards" no "$(saw 'generation 2')"
 fi
 
+# A container that is told to stop and does not stop. Upstream's init.sh traps
+# TERM and kills the server it is holding — but if there is no server yet, its trap
+# errors and it goes right on running, and PID 1 used to wait for it forever. On
+# 1787015974836 that left a container signalled one second into its life sitting
+# there for 3m14s, its world still loading, until the platform killed it.
+echo "a generation that will not take the stop signal"
+if run_stub ignore -e FLUX_STOP_GRACE_IDLE=5; then
+  docker kill --signal TERM "${CONTAINER}" >/dev/null
+  check "the signal is acknowledged" yes "$(saw 'stopping for good')"
+  check "and the deadline ends the container itself" 137 "$(timeout 60 docker wait ${CONTAINER})"
+  check "saying so" yes "$(saw 'told to stop 5s ago')"
+  check "with no restart afterwards" no "$(saw 'generation 2')"
+fi
+
 echo "a server that will not stay up"
 if run_stub exit -e FLUX_RESTART_MAX_ATTEMPTS=2; then
   check "it gives up and ends the container" 42 "$(timeout 60 docker wait ${CONTAINER})"

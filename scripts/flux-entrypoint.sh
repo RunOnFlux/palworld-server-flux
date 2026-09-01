@@ -40,6 +40,15 @@ FLUX_RESTART_MODE="${FLUX_RESTART_MODE:-process}"
 FLUX_RESTART_MAX_ATTEMPTS="${FLUX_RESTART_MAX_ATTEMPTS:-5}"
 FLUX_RESTART_WINDOW="${FLUX_RESTART_WINDOW:-3600}"
 FLUX_RESTART_BACKOFF="${FLUX_RESTART_BACKOFF:-10}"
+# How long a generation may take to wind down after the container has been told to
+# stop, before this ends it rather than waiting to be killed. Two values, because
+# there are two very different things to wait for: a running server may be in the
+# middle of the save that upstream's SIGTERM handler asks for, and gets the same 90
+# seconds the scheduled restart allows it; a generation with no server in it — or
+# one whose server started after the signal, which is a server that should never
+# have been started — has nothing to save and only init.sh's own cleanup left.
+FLUX_STOP_GRACE="${FLUX_STOP_GRACE:-90}"
+FLUX_STOP_GRACE_IDLE="${FLUX_STOP_GRACE_IDLE:-30}"
 
 # A marker left behind by a previous life of this container would be read as a
 # restart that was never asked for. /tmp survives a container restart (the
@@ -66,6 +75,7 @@ init_pid=""
 init_pgid=""
 guard_pid=""
 terminating=0
+term_game_pid=""
 generation=0
 crash_dumps=0
 own_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
@@ -74,6 +84,9 @@ declare -a restart_history=()
 # shellcheck disable=SC2329  # invoked by the trap below
 term_handler() {
   terminating=1
+  # Which server, if any, was running when the signal landed. Only that one can be
+  # in the middle of a save worth waiting for; see FLUX_STOP_GRACE.
+  term_game_pid="$(flux_game_pid)"
   flux_log "signal received: stopping for good, no restart will follow"
   [ -n "${init_pid}" ] && kill -TERM "${init_pid}" 2>/dev/null
 }
@@ -167,6 +180,7 @@ sweep_generation() {
 # is a server with no protection at all.
 wait_for_generation() {
   local rc marker_seen=0 forced=0 now phase last_phase=""
+  local term_seen=0 term_forced=0 stop_deadline
   # Stops the moment the server process exists: from there the guard owns the
   # story, and this loop goes back to costing nothing.
   local watch_boot=1
@@ -201,6 +215,33 @@ wait_for_generation() {
         if [ "${forced}" = "0" ]; then
           forced=1
           flux_log "WARN a restart was requested ${FLUX_RESTART_GRACE:-60}s ago and the server is still winding down; forcing this generation to end"
+        fi
+        kill -KILL "${init_pid}" 2>/dev/null
+      fi
+    fi
+
+    # A stop has a deadline for the same reason a restart does, and it was missing.
+    # Without one, a generation that does not take the signal keeps the container
+    # alive until the platform kills it — with no line in the log to say what
+    # happened, and with a game still registered in the community list on the way
+    # out. Seen on 1787015974836: a container signalled one second into its life
+    # sat there for 3m14s with its world still loading, because upstream's own trap
+    # ran before there was a pid to kill (kill: '': not a pid or valid job spec)
+    # and nothing here was ever going to stop waiting.
+    if [ "${terminating}" = "1" ]; then
+      now="$(date -u +%s)"
+      [ "${term_seen}" = "0" ] && term_seen="${now}"
+      # The full grace is for the server that was running when the signal arrived,
+      # because that one may be saving. Anything else — no server, or one that only
+      # started afterwards — gets the short one.
+      stop_deadline="${FLUX_STOP_GRACE_IDLE}"
+      if [ -n "${term_game_pid}" ] && [ "${term_game_pid}" = "$(flux_game_pid)" ]; then
+        stop_deadline="${FLUX_STOP_GRACE}"
+      fi
+      if [ $((now - term_seen)) -ge "${stop_deadline}" ]; then
+        if [ "${term_forced}" = "0" ]; then
+          term_forced=1
+          flux_log "WARN this container was told to stop ${stop_deadline}s ago and the generation is still winding down; ending it here rather than waiting to be killed"
         fi
         kill -KILL "${init_pid}" 2>/dev/null
       fi

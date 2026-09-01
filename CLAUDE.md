@@ -109,6 +109,12 @@ release (`vX.Y.Z` only, never `:latest`/`:dev`) when one appears. Needs
   Holding it also destroys it — the uptime edge climbs again from its new base — so
   the hold turned a one-sample verdict into a three-strike countdown, four minutes
   late, on 1787015974836.
+- **Terminating has a deadline too** (`FLUX_STOP_GRACE`, and `FLUX_STOP_GRACE_IDLE`
+  when the server that was running at signal time is gone). `wait_for_generation`
+  used to wait forever for an `init.sh` that ignored the TERM, which on a redeploy
+  race left a container running a game it had been told to stop. The long grace
+  exists so upstream's save-on-SIGTERM is never cut short: do not shorten it
+  without knowing what the platform's own stop timeout is.
 - **`/tmp` survives a container restart.** The restart marker is cleared on boot;
   if it were not, the supervisor would read it as a restart nobody asked for.
 - **Never signal your own process group.** `sweep_generation` kills

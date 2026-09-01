@@ -285,6 +285,17 @@ supervisor records that it is stopping for good, and the container exits with
 init's own status. That is what a redeploy, a dashboard Stop, and a node shutdown
 all look like, and they must all still work.
 
+That stop has a deadline, for the same reason a restart does. Without one, a
+generation that does not take the signal keeps the container alive until the
+platform kills it — no line in the log to say what happened, and a game still
+registered in the community list on the way out. It is not theoretical: a
+container signalled one second into its life sat there for 3m14s with its world
+still loading, because upstream's own trap ran before there was a pid to kill.
+A server that was already running when the signal arrived gets
+`FLUX_STOP_GRACE` seconds, because it may be in the middle of the save that
+handler asks for; a generation with no server in it, or one whose server only
+started after the signal, gets `FLUX_STOP_GRACE_IDLE`.
+
 ## Configuration
 
 Everything upstream supports works unchanged. On top of it:
@@ -311,6 +322,8 @@ Everything upstream supports works unchanged. On top of it:
 | `FLUX_RESTART_WINDOW` | `3600` | seconds the attempt count looks back over |
 | `FLUX_RESTART_BACKOFF` | `10` | seconds between generations |
 | `FLUX_RESTART_GRACE` | `60` | seconds a requested restart may spend winding down before the supervisor forces it |
+| `FLUX_STOP_GRACE` | `90` | seconds a generation may spend winding down after `docker stop`, when the server that was running when the signal arrived is still up and may be saving |
+| `FLUX_STOP_GRACE_IDLE` | `30` | the same deadline when there is no such server left to wait for |
 | `FLUX_REBOOT_GRACEFUL_WAIT` | `90` | seconds the scheduled restart waits for the server to shut itself down |
 | `FLUX_GUARD_LOG` | `/palworld/Pal/Saved/flux-guard.log` | persistent log, capped at 2000 lines |
 | `FLUX_CRASH_KEEP` | `20` | crash dumps kept on the volume; the rest are deleted once per generation, `0` keeps them all |
