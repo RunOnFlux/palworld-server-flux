@@ -87,6 +87,12 @@ Three things it deliberately will not do:
 - **It never acts before the server has been seen working once** since boot, and
   never in the first `FLUX_GUARD_MIN_UPTIME` seconds. Loading a large world takes
   minutes, and a server that comes up broken is not made better by a restart loop.
+  The age half does not apply to a **proven** world loss, because neither reason
+  can be true of one: the server has already been seen healthy this generation,
+  which means a loaded world answering with fps, and the proof is that the same
+  process then lost it. Holding it anyway cost one server four minutes of a dead
+  world — the proof expired while it was held, since the uptime counter climbs
+  again from its new base, and what was left took the three-strike path.
 - **It never saves.** In every state that gets it here the in-memory world is
   already gone or frozen, and asking a broken server to save risks writing that
   emptiness over the customer's last good save. What a kill costs is the interval

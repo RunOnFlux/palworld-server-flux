@@ -303,6 +303,24 @@ if run_stub server -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_GUARD_RESTART_DELAY=0 \
   check "the container never ended" true "$(docker inspect -f '{{.State.Running}}' ${CONTAINER})"
 fi
 
+# 1787015974836, generation 2: healthy at 09:21:55, world proved gone at 09:22:55,
+# and not restarted until 09:26:58 — the min-uptime rule held a proof, the proof
+# expired while it was held (the uptime counter climbs again from its new base),
+# and what was left took the patient path. Four minutes of a dead world, three of
+# them re-proving something one sample had settled.
+echo "a world that unloads before the min-uptime rule expires"
+if run_stub server -e FLUX_GUARD_MIN_UPTIME=300 -e FLUX_GUARD_RESTART_DELAY=4; then
+  wait_for "healthy for the first time" 30
+  docker exec "${CONTAINER}" sh -c 'printf "{\"serverfps\":0,\"currentplayernum\":0,\"uptime\":12,\"days\":0}" > /tmp/metrics.json'
+  wait_for "starting the server (generation 2)" 60
+  check "a proven loss is not held by the age of the generation" \
+    no "$(saw 'holding: worldless')"
+  check "and is still acted on at once" \
+    yes "$(saw 'the world is provably gone, so there is nobody to warn — restarting now')"
+  check "the generation is replaced" yes "$(saw 'starting the server (generation 2)')"
+  check "the container never ended" true "$(docker inspect -f '{{.State.Running}}' ${CONTAINER})"
+fi
+
 echo "a world that keeps unloading"
 # A rebuilt container cannot fix a bug in the game that only reproduces on this
 # customer's save, and buying one costs a full SteamCMD install. Restarts that the

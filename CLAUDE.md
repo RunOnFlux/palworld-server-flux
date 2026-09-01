@@ -103,6 +103,12 @@ release (`vX.Y.Z` only, never `:latest`/`:dev`) when one appears. Needs
   which does not stop a host stepping its clock, it stops the engine dying on it.
   Nothing in the capture may decide anything; the verdict is already made when it
   runs.
+- **A proven world loss is not held by `FLUX_GUARD_MIN_UPTIME`.** The rule exists
+  for a world that is still loading and for a server that comes up broken; a proof
+  implies neither, because the guard has already seen this generation healthy.
+  Holding it also destroys it — the uptime edge climbs again from its new base — so
+  the hold turned a one-sample verdict into a three-strike countdown, four minutes
+  late, on 1787015974836.
 - **`/tmp` survives a container restart.** The restart marker is cleared on boot;
   if it were not, the supervisor would read it as a restart nobody asked for.
 - **Never signal your own process group.** `sweep_generation` kills

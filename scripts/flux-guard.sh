@@ -326,7 +326,15 @@ while true; do
   # A fresh guard is started for every generation, so this is the age of the
   # generation, not of the container — the distinction matters when reading the
   # log of a container that has been up for days.
-  if [ "${age}" -lt "${FLUX_GUARD_MIN_UPTIME}" ]; then
+  #
+  # It does not apply to a proven world loss. The rule is there for a world that is
+  # still loading and for a server that comes up broken, and neither can be true
+  # here: the check above has already established that this generation was healthy
+  # once, which means a loaded world answering with fps, and the proof is that the
+  # same process then lost it. Holding anyway is what cost 1787015974836 four
+  # minutes of a dead world at 09:22:55 — three of them spent re-proving, on the
+  # slow path, something one sample had already settled.
+  if [ "${age}" -lt "${FLUX_GUARD_MIN_UPTIME}" ] && [ "${GUARD_PROVEN}" != "1" ]; then
     flux_log "holding: ${verdict} confirmed but this generation is only ${age}s old (min ${FLUX_GUARD_MIN_UPTIME}s)"
     continue
   fi
