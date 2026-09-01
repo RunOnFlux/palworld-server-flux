@@ -88,7 +88,12 @@ release (`vX.Y.Z` only, never `:latest`/`:dev`) when one appears. Needs
   and now the wrong side of the restart budget.
 - **Never make the recovery path save.** A worldless server asked to save can
   write that emptiness over the last good save. The scheduled reboot saves only
-  after confirming fps > 0.
+  after confirming fps > 0. `flux_force_restart` asks for `/v1/api/stop` — the
+  game's forced stop, documented to write nothing, and asked for only so the
+  server deregisters from the community list instead of leaving an orphan entry
+  behind on every restart. Documented is not observed: the save is stamped either
+  side of the attempt and `flux_warn_if_save_changed` is what tells us the day
+  that assumption breaks. `FLUX_FORCE_STOP_WAIT=0` reverts to a bare SIGKILL.
 - **The kill destroys the evidence, so read the scene first.** `flux_capture_fault`
   runs once per conviction, before the process ends, and is the only source we have
   for why a world unloads: the engine's log under `Pal/Saved/Logs` (its `[LOG]`

@@ -254,6 +254,25 @@ Neither reads the exit code today. Depending on that path for every restart is
 exactly what this image avoids: it is slower, it is conditional on things that
 have nothing to do with the game, and it is not ours.
 
+**The server is asked to leave before it is killed.** A `SIGKILL` ends a
+generation in one step, and for two years that was the whole of it. But a server
+started with `-publiclobby` registers itself with Pocketpair's community list on
+every boot, and a killed process never tells that list it is going: the entry is
+orphaned there until it times out, the next generation registers a second one
+beside it, and both also land in the *Recent Servers* list of every client that
+has ever joined — where nothing on this side can ever remove them. On a server the
+guard restarts ten times a day, that is what the customer sees first.
+
+So the game is asked to stop first, and killed only if it does not: `/v1/api/stop`,
+the game's own forced stop, then up to `FLUX_FORCE_STOP_WAIT` seconds for the
+process to go, then the `SIGKILL` exactly as before. Unlike `/v1/api/shutdown` it
+is documented to write nothing, which matters here more than anywhere — **the
+recovery path must never save**, because a world that has already unloaded would
+be written over the customer's last good one. Documented is not observed, so the
+save on disk is stamped before and after the attempt and a `WARN` names the
+off switch the first time a stop is caught writing. `FLUX_FORCE_STOP_WAIT=0` goes
+back to killing the process outright.
+
 `docker stop` is the one case that is never followed by a restart. The signal is
 forwarded to `init.sh` so upstream's own SIGTERM handler saves the world, the
 supervisor records that it is stopping for good, and the container exits with
@@ -279,6 +298,7 @@ Everything upstream supports works unchanged. On top of it:
 | `FLUX_GUARD_CLOCK_SKEW` | `2` | seconds the wall clock may disagree with the monotonic one between samples before the host is called out for stepping it; `0` stops looking |
 | `FLUX_FAULT_LOG_LINES` | `40` | lines of the engine's own log quoted when a fault is captured |
 | `FLUX_GAME_LOG_DIR` | `/palworld/Pal/Saved/Logs` | where that log is looked for; the newest `*.log` in it wins |
+| `FLUX_FORCE_STOP_WAIT` | `8` | seconds a convicted server is given to stop on its own after `/v1/api/stop`, before the `SIGKILL`; `0` skips the request |
 | `FLUX_GUARD_DRY_RUN` | `false` | log the verdict and never act |
 | `FLUX_RESTART_MODE` | `process` | `process` restarts the server inside the container; `container` ends the container and lets the platform rebuild it |
 | `FLUX_RESTART_MAX_ATTEMPTS` | `5` | in-place restarts allowed inside the window before the container ends instead; world unloads and the nightly reboot are not counted |

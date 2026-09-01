@@ -398,6 +398,51 @@ check "a field that is not there reads zero" 0 \
 check "a process that is not there reads zero" 0 \
   "$(FLUX_PROC_ROOT=${tmp}/proc flux_proc_status_field 9999 VmRSS)"
 
+echo "flux_wait_for_exit"
+# /proc is the whole test: a directory that is there is a process that is still
+# running, and one that is gone is one that left.
+went() {
+  local t0 t1 out rc
+  t0="$(date +%s)"
+  out="$(FLUX_PROC_ROOT=${tmp}/proc flux_wait_for_exit "$1" "$2")"
+  rc=$?
+  t1="$(date +%s)"
+  printf '%s after %ss (reported %s)' \
+    "$([ "${rc}" = 0 ] && printf gone || printf still-there)" "$((t1 - t0))" "${out}"
+}
+check "a process already gone costs no wait at all" "gone after 0s (reported 0)" \
+  "$(went 9999 5)"
+check "one that stays is given the whole deadline" "still-there after 2s (reported 2)" \
+  "$(went 4242 2)"
+check "a deadline of zero is one look and no sleep" "still-there after 0s (reported 0)" \
+  "$(went 4242 0)"
+
+echo "flux_save_stamp"
+save_dir="${tmp}/stamp/SaveGames/0/ABCD"
+mkdir -p "${save_dir}"
+FLUX_SAVE_GLOB="${tmp}/stamp/SaveGames/0/*/Level.sav"
+flux_save_stamp >/dev/null 2>&1
+check "no save on disk is not a stamp" 1 "$?"
+printf 'world' >"${save_dir}/Level.sav"
+stamp_before="$(FLUX_SAVE_GLOB="${FLUX_SAVE_GLOB}" flux_save_stamp)"
+check "an untouched save stamps the same twice" "${stamp_before}" \
+  "$(FLUX_SAVE_GLOB="${FLUX_SAVE_GLOB}" flux_save_stamp)"
+printf 'world and then some' >"${save_dir}/Level.sav"
+check "a save that grew stamps differently" different \
+  "$([ "$(FLUX_SAVE_GLOB="${FLUX_SAVE_GLOB}" flux_save_stamp)" != "${stamp_before}" ] && printf different || printf same)"
+
+echo "flux_warn_if_save_changed"
+# The alarm on the polite stop. It must fire on a write and stay silent otherwise,
+# including when there was no save to compare against in the first place.
+warned() {
+  FLUX_SAVE_GLOB="${tmp}/stamp/SaveGames/0/*/Level.sav" flux_warn_if_save_changed "$1" \
+    | grep -c 'WARN the save on disk changed'
+}
+check "a save that did not move says nothing" 0 \
+  "$(warned "$(FLUX_SAVE_GLOB="${tmp}/stamp/SaveGames/0/*/Level.sav" flux_save_stamp)")"
+check "a save that moved is shouted about" 1 "$(warned "${stamp_before}")"
+check "nothing to compare against is not an alarm" 0 "$(warned "")"
+
 echo "flux_newest_game_log"
 logs="${tmp}/Logs"
 mkdir -p "${logs}"

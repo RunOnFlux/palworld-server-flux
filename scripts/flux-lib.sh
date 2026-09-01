@@ -855,29 +855,115 @@ flux_restart_countdown() {
 # supervisor in flux-entrypoint.sh, which starts a fresh server in place (or ends
 # the container, under FLUX_RESTART_MODE=container).
 #
-# We SIGKILL rather than ask the server to shut down gracefully, and we never ask
-# it to save first. In every state that gets us here the in-memory world is
-# already gone or frozen, and telling a broken server to save risks writing that
-# emptiness over the customer's last good save. What a kill costs is the interval
-# since the last autosave, which was lost the moment the fault happened.
+# We never ask it to save first, and we are never polite for long. In every state
+# that gets us here the in-memory world is already gone or frozen, and telling a
+# broken server to save risks writing that emptiness over the customer's last good
+# save. What ending it costs is the interval since the last autosave, which was
+# lost the moment the fault happened.
 #
-# Enforcing the deadline is flux-entrypoint.sh's job, not ours: it runs as root
+# But it is asked to stop before it is killed, and that is not politeness for its
+# own sake. A server started with -publiclobby registers itself with Pocketpair's
+# community list on every boot, and a SIGKILL never tells the list it is leaving:
+# the entry is orphaned there until it times out, the next generation registers a
+# second one beside it, and each one also lands in the Recent Servers list of
+# every client that ever joined — where nothing on this side can ever remove it.
+# Twenty in-place restarts a day is twenty of those. /v1/api/stop is the game's
+# own forced stop and, unlike /v1/api/shutdown, it is documented to write nothing.
+#
+# "Documented" is not "observed", and this path may never write:
+# FLUX_FORCE_STOP_WAIT=0 turns the whole attempt off and goes back to killing the
+# process outright, and the save on disk is stamped before and after so that a
+# stop that does write is caught the first time it happens rather than the first
+# time a customer notices. The wait is short by design — the deadline in
+# flux-entrypoint.sh is sixty seconds, and everything here has to fit inside it
+# with room for the sweep.
+#
+# Enforcing that deadline is flux-entrypoint.sh's job, not ours: it runs as root
 # and can always end the generation, while the scheduled reboot runs from cron as
 # the steam user and cannot signal init.
 #
 # $1 reason, recorded for the log and for flux-entrypoint.sh's exit code.
+FLUX_FORCE_STOP_WAIT="${FLUX_FORCE_STOP_WAIT:-8}"
+
 flux_force_restart() {
-  local reason="$1" pid
+  local reason="$1" pid code waited save_before=""
   flux_log "RESTART requested: ${reason}"
   printf '%s\n' "${reason}" >"${FLUX_RESTART_MARKER}" 2>/dev/null || true
 
   pid="$(flux_game_pid)"
-  if [ -n "${pid}" ]; then
-    flux_log "sending SIGKILL to ${FLUX_GAME_PROCESS} (pid ${pid})"
-    kill -KILL "${pid}" 2>/dev/null || flux_log "WARN could not signal pid ${pid} (running as $(id -un))"
-  else
+  if [ -z "${pid}" ]; then
     flux_log "no ${FLUX_GAME_PROCESS} process found; this generation is already on its way out"
+    return 0
   fi
+
+  if [ "${FLUX_FORCE_STOP_WAIT:-0}" -gt 0 ] 2>/dev/null; then
+    save_before="$(flux_save_stamp)" || save_before=""
+    flux_rest stop >/dev/null 2>&1
+    code="${FLUX_REST_CODE}"
+    # 000 is not a refusal here. A server that takes the request and goes down
+    # before it finishes answering leaves curl with nothing to read, which is
+    # exactly what a working stop looks like from this side.
+    case "${code}" in
+      200|000)
+        if waited="$(flux_wait_for_exit "${pid}" "${FLUX_FORCE_STOP_WAIT}")"; then
+          flux_log "asked the server to stop (HTTP ${code}) and it went down on its own after ${waited}s, so its community-list entry leaves with it"
+          flux_warn_if_save_changed "${save_before}"
+          return 0
+        fi
+        flux_log "asked the server to stop (HTTP ${code}) but it was still up ${waited}s later"
+        ;;
+      *)
+        flux_log "the server would not take a stop request (HTTP ${code})"
+        ;;
+    esac
+    flux_warn_if_save_changed "${save_before}"
+  fi
+
+  flux_log "sending SIGKILL to ${FLUX_GAME_PROCESS} (pid ${pid})"
+  kill -KILL "${pid}" 2>/dev/null || flux_log "WARN could not signal pid ${pid} (running as $(id -un))"
+}
+
+# Waits up to $2 seconds for pid $1 to leave. Prints the seconds waited either
+# way; returns 0 only if it went. /proc rather than `kill -0`, which cannot tell
+# a process that has exited from one this user may not signal.
+flux_wait_for_exit() {
+  local pid="$1" seconds="${2:-0}" waited=0
+  while :; do
+    if [ ! -d "${FLUX_PROC_ROOT}/${pid}" ]; then
+      printf '%s' "${waited}"
+      return 0
+    fi
+    [ "${waited}" -lt "${seconds}" ] || break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  printf '%s' "${waited}"
+  return 1
+}
+
+# mtime and size of the newest save on disk, as one opaque string. It is only ever
+# compared against itself, and it exists for one reason: so that a shutdown path
+# which is supposed to write nothing can be caught writing something.
+flux_save_stamp() {
+  local f newest=""
+  for f in ${FLUX_SAVE_GLOB}; do
+    [ -f "${f}" ] || continue
+    if [ -z "${newest}" ] || [ "${f}" -nt "${newest}" ]; then
+      newest="${f}"
+    fi
+  done
+  [ -n "${newest}" ] || return 1
+  stat -c '%Y %s' "${newest}" 2>/dev/null
+}
+
+# The alarm for the paragraph above. Loud on purpose and names its own off switch:
+# a world that has already unloaded must never be the thing that gets written.
+flux_warn_if_save_changed() {
+  local before="${1:-}" after
+  [ -n "${before}" ] || return 0
+  after="$(flux_save_stamp)" || return 0
+  [ "${after}" != "${before}" ] || return 0
+  flux_log "WARN the save on disk changed while the server was being stopped (${before} -> ${after}). /v1/api/stop is writing, which it must not do on a world that may already be gone — set FLUX_FORCE_STOP_WAIT=0 to go back to killing the process outright."
 }
 
 # --- what a restart says about the container ---------------------------------

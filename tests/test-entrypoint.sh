@@ -64,9 +64,27 @@ case "${STUB_MODE:-linger}" in
     #   /tmp/stall     headers go out and then nothing does, which is what a wedged
     #                  game thread looks like from the probe's side
     printf '{"serverfps":59,"currentplayernum":1,"uptime":600,"days":523}' > /tmp/metrics.json
-    python3 -c '
+    ( exec -a PalServer-Linux-Shipping sleep 600 ) &
+    game_pid=$!
+    GAME_PID="${game_pid}" python3 -c '
 import http.server, os, time
 class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        # /v1/api/stop is the game telling the community list it is leaving, and
+        # the reason the guard asks before it kills. Off unless a test asks for it:
+        # every case written before this one expects the SIGKILL.
+        if os.path.exists("/tmp/force401"):
+            self.send_response(401)
+            self.send_header("Content-Length","0")
+            self.end_headers(); return
+        if self.path.startswith("/v1/api/stop") and os.path.exists("/tmp/honourstop"):
+            self.send_response(200)
+            self.send_header("Content-Length","2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            os.kill(int(os.environ["GAME_PID"]), 9)
+            return
+        self.send_error(404)
     def do_GET(self):
         if os.path.exists("/tmp/force401"):
             self.send_response(401)
@@ -91,8 +109,6 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 http.server.HTTPServer(("127.0.0.1", 8212), H).serve_forever()
 ' &
-    ( exec -a PalServer-Linux-Shipping sleep 600 ) &
-    game_pid=$!
     # A /proc the test can write to, so a world unload can take its gigabytes with
     # it the way a real one does. Only used when FLUX_PROC_ROOT points here.
     if [ -n "${FLUX_FAKE_PROC:-}" ]; then
@@ -266,6 +282,25 @@ if run_stub server -e FLUX_GUARD_FAILURES=2 -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_G
   wait_for "restart cancelled" 40
   check "the restart is called off" yes "$(saw 'restart cancelled: the server recovered')"
   check "and nothing was killed" no "$(saw 'sending SIGKILL')"
+fi
+
+# A killed server never tells Pocketpair's community list it is going, so the entry
+# is orphaned there and the next generation registers a second one beside it —
+# which is what the duplicates in a player's Recent Servers list are made of. The
+# guard asks first, and only kills what will not go.
+echo "a convicted server that takes the stop request"
+if run_stub server -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_GUARD_RESTART_DELAY=0 \
+  -e FLUX_FORCE_STOP_WAIT=15; then
+  wait_for "healthy for the first time" 30
+  docker exec "${CONTAINER}" sh -c 'touch /tmp/honourstop'
+  docker exec "${CONTAINER}" sh -c 'printf "{\"serverfps\":0,\"currentplayernum\":0,\"uptime\":12,\"days\":0}" > /tmp/metrics.json'
+  wait_for "starting the server (generation 2)" 60
+  check "the server is asked to stop rather than killed" \
+    yes "$(saw 'and it went down on its own after')"
+  check "so no SIGKILL is needed" no "$(saw 'sending SIGKILL')"
+  check "and the generation is replaced as usual" yes "$(saw 'starting the server (generation 2)')"
+  check "nothing wrote to the save on the way out" no "$(saw 'WARN the save on disk changed')"
+  check "the container never ended" true "$(docker inspect -f '{{.State.Running}}' ${CONTAINER})"
 fi
 
 echo "a world that keeps unloading"
