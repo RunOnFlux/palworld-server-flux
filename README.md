@@ -124,6 +124,34 @@ seconds. One wake per fall, re-armed only when a sample sees memory back up.
 also the image's `HEALTHCHECK`, replacing `pgrep`, so `docker inspect` finally
 agrees with what the players see. It restarts nothing by itself.
 
+**What it writes down before it acts.** The restart destroys the evidence: the
+process the guard is about to end is the only copy of what went wrong. Twenty
+world unloads on one server inside thirty-four hours produced no crash dump, not
+one engine line on stdout, and nothing in the container log but the guard's own
+verdict — so "why does this world unload every seventy minutes" has no data behind
+it. At the moment of a conviction, once, the guard now reads what is about to
+disappear:
+
+- the last `FLUX_FAULT_LOG_LINES` lines of the engine's own log under
+  `Pal/Saved/Logs`. Only its `[LOG]` lines reach stdout; that file has the rest.
+- the process's own high-water mark, which the once-a-minute sampling can only
+  approximate, alongside its resident, virtual and thread counts.
+- the container's memory ceiling and its OOM counters, from cgroup v2 or v1. A
+  world that unloads with the cgroup against its limit is a sizing problem; one
+  that unloads with gigabytes to spare is a game bug, and nothing in this image
+  could tell those apart before.
+- how far the wall clock has drifted from the monotonic one. Every server we run
+  sets `ALLOW_NEGATIVE_DELTA_TIME=true`, which does not stop a host stepping its
+  clock — it stops the engine treating the step as fatal and leaves it running on
+  whatever state that produced. A step of `FLUX_GUARD_CLOCK_SKEW` seconds or more
+  between two samples also gets its own line when it happens, so a step that lands
+  next to a world unload sits next to it in the log.
+- what `/v1/api/info` still says, the one endpoint a worldless server keeps
+  answering properly.
+
+All of it is best effort and none of it decides anything: the verdict is reached
+before the capture runs, and a reading that cannot be taken is logged as missing.
+
 ### 2. A scheduled restart that actually restarts (`scripts/flux-reboot.sh`)
 
 Upstream's `auto_reboot.sh` asks the server to save and then refuses to shut down
@@ -248,6 +276,9 @@ Everything upstream supports works unchanged. On top of it:
 | `FLUX_GUARD_RSS_MIN_PEAK_KB` | `2097152` | peak the process must have reached before that fall is believed |
 | `FLUX_GUARD_RESTART_DELAY` | `60` | seconds between deciding and acting, announced in game (skipped on a proven world loss) |
 | `FLUX_GUARD_BODY_CHARS` | `240` | how much of the metrics body to quote in the log on the first bad sample |
+| `FLUX_GUARD_CLOCK_SKEW` | `2` | seconds the wall clock may disagree with the monotonic one between samples before the host is called out for stepping it; `0` stops looking |
+| `FLUX_FAULT_LOG_LINES` | `40` | lines of the engine's own log quoted when a fault is captured |
+| `FLUX_GAME_LOG_DIR` | `/palworld/Pal/Saved/Logs` | where that log is looked for; the newest `*.log` in it wins |
 | `FLUX_GUARD_DRY_RUN` | `false` | log the verdict and never act |
 | `FLUX_RESTART_MODE` | `process` | `process` restarts the server inside the container; `container` ends the container and lets the platform rebuild it |
 | `FLUX_RESTART_MAX_ATTEMPTS` | `5` | in-place restarts allowed inside the window before the container ends instead; world unloads and the nightly reboot are not counted |

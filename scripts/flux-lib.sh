@@ -210,11 +210,20 @@ flux_game_pid() { pgrep -f "${FLUX_GAME_PROCESS}" 2>/dev/null | head -1; }
 # every few seconds rather than every minute, and a fork per glance is a poor way
 # to pay for something advertised as free.
 flux_game_rss_kb() {
-  local pid="${1:-}" key value
+  local pid="${1:-}"
   [ -n "${pid}" ] || pid="$(flux_game_pid)"
   [ -n "${pid}" ] || { printf '0'; return; }
+  flux_proc_status_field "${pid}" VmRSS
+}
+
+# One field out of /proc/<pid>/status, by name and without the unit: VmRSS and
+# VmHWM come back in kB, Threads as a count. Prints 0 for a field or a process
+# that is not there, which every caller reads as "no reading" rather than "zero".
+flux_proc_status_field() {
+  local pid="$1" want="$2" key value
+  [ -n "${pid}" ] || { printf '0'; return; }
   while read -r key value _; do
-    if [ "${key}" = "VmRSS:" ]; then
+    if [ "${key}" = "${want}:" ]; then
       printf '%s' "${value}"
       return
     fi
@@ -356,6 +365,151 @@ flux_prune_crash_dumps() {
     -printf '%T@\t%p\n' 2>/dev/null | sort -rn | tail -n "+$((keep + 1))" | cut -f2-)
 
   [ "${removed}" -gt 0 ] && flux_log "pruned ${removed} old crash dump(s) from ${FLUX_CRASH_DIR}, keeping the newest ${keep}"
+  return 0
+}
+
+# --- capturing what the fault looked like ------------------------------------
+# The guard convicts on a handful of numbers and then destroys the evidence: the
+# process it is about to kill is the only copy of what went wrong. Twenty world
+# unloads on 1785894699157 inside thirty-four hours produced no crash dump, not
+# one engine line on stdout and nothing in the container log but our own verdict.
+# "Why does this world unload every seventy minutes" has, today, no data behind it.
+#
+# So before the kill, once, everything that is cheap to read and gone a second
+# later:
+#
+#   - the engine's own log. Only its [LOG] lines reach stdout; Saved/Logs is on
+#     the persistent volume and holds the rest, including whatever it had to say
+#     in the seconds before the world went away.
+#   - the process's own high-water mark, which is the peak our once-a-minute
+#     sampling can only approximate.
+#   - the container's memory ceiling and its OOM counters. A world that unloads
+#     with the cgroup against its limit is a sizing problem; one that unloads with
+#     gigabytes to spare is a game bug. Nothing here can tell those apart today.
+#   - how far the wall clock has drifted from the monotonic one. Every server we
+#     run sets ALLOW_NEGATIVE_DELTA_TIME=true, which does not fix a clock that
+#     steps backwards — it stops the engine asserting when it does, and leaves it
+#     to carry on with whatever state that produced. If these nodes step their
+#     clocks, this is where it shows up.
+#   - what /v1/api/info still says: the one endpoint a worldless server keeps
+#     answering properly.
+#
+# Best effort throughout. A reading that cannot be taken is reported as missing,
+# and nothing here decides anything — the verdict was reached before it ran.
+FLUX_GAME_LOG_DIR="${FLUX_GAME_LOG_DIR:-/palworld/Pal/Saved/Logs}"
+FLUX_FAULT_LOG_LINES="${FLUX_FAULT_LOG_LINES:-40}"
+FLUX_CGROUP_ROOT="${FLUX_CGROUP_ROOT:-/sys/fs/cgroup}"
+FLUX_PROC_UPTIME="${FLUX_PROC_UPTIME:-/proc/uptime}"
+
+# The newest *.log the engine has written, or nothing. UE names it after the
+# project (Pal.log) and rotates the previous one to Pal-backup-<stamp>.log, so
+# "newest" is the right answer rather than a fixed name.
+flux_newest_game_log() {
+  local newest
+  [ -d "${FLUX_GAME_LOG_DIR}" ] || return 1
+  newest="$(find "${FLUX_GAME_LOG_DIR}" -maxdepth 1 -type f -name '*.log' \
+    -printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -1 | cut -f2-)"
+  [ -n "${newest}" ] || return 1
+  printf '%s' "${newest}"
+}
+
+# Seconds since boot, integer, from /proc/uptime. It is the clock that cannot be
+# stepped, which is the whole point of reading it.
+flux_monotonic() {
+  local up rest
+  read -r up rest 2>/dev/null <"${FLUX_PROC_UPTIME}" || { printf '0'; return; }
+  printf '%s' "${up%%.*}"
+}
+
+# Pure. How far the wall clock moved that the monotonic clock did not, between two
+# samples. Zero on a machine whose clock only ticks; negative when the wall clock
+# was stepped backwards, which is the case ALLOW_NEGATIVE_DELTA_TIME exists for.
+#   $1 wall seconds elapsed   $2 monotonic seconds elapsed
+flux_clock_skew() {
+  printf '%s' "$(( ${1:-0} - ${2:-0} ))"
+}
+
+# What the whole container is allowed and how close it is to it, as one line, from
+# cgroup v2 or v1 — whichever this kernel presents. Returns non-zero when neither
+# is readable, which an unprivileged container is entitled to.
+flux_cgroup_memory() {
+  local root="${FLUX_CGROUP_ROOT}" current="" max="" oom=0 oom_kill=0 failcnt="" key value
+  if [ -r "${root}/memory.current" ]; then
+    current="$(cat "${root}/memory.current" 2>/dev/null)"
+    max="$(cat "${root}/memory.max" 2>/dev/null)"
+    if [ -r "${root}/memory.events" ]; then
+      while read -r key value; do
+        case "${key}" in
+          oom) oom="${value}" ;;
+          oom_kill) oom_kill="${value}" ;;
+        esac
+      done <"${root}/memory.events"
+    fi
+    printf 'current=%s max=%s oom=%s oom_kill=%s' \
+      "$(flux_mib "${current}")" "$(flux_mib "${max}")" "${oom}" "${oom_kill}"
+    return 0
+  fi
+  if [ -r "${root}/memory/memory.usage_in_bytes" ]; then
+    current="$(cat "${root}/memory/memory.usage_in_bytes" 2>/dev/null)"
+    max="$(cat "${root}/memory/memory.limit_in_bytes" 2>/dev/null)"
+    # v1 has no oom_kill counter to read; failcnt counts the times an allocation
+    # hit the limit, which answers the same question one step earlier.
+    failcnt="$(cat "${root}/memory/memory.failcnt" 2>/dev/null)"
+    printf 'current=%s max=%s failcnt=%s' \
+      "$(flux_mib "${current}")" "$(flux_mib "${max}")" "${failcnt:-0}"
+    return 0
+  fi
+  return 1
+}
+
+# Bytes as megabytes, and the two ways a cgroup says "no limit" as the word.
+flux_mib() {
+  local v="${1:-}"
+  [[ "${v}" =~ ^[0-9]+$ ]] || { printf 'unlimited'; return; }
+  # cgroup v1 writes its no-limit as PAGE_COUNTER_MAX * PAGE_SIZE, a number in the
+  # exabytes. Anything past a petabyte is that, not a reading.
+  [ "${v}" -gt 1125899906842624 ] && { printf 'unlimited'; return; }
+  printf '%sM' "$((v / 1048576))"
+}
+
+# Everything above, into the log, at the moment of a conviction.
+#   $1 verdict   what the guard decided, for the first line
+#   $2 pid       the game process, from the sample that convicted it
+#   $3 skew      cumulative clock skew this generation, in seconds (optional)
+flux_capture_fault() {
+  local verdict="$1" pid="${2:-}" skew="${3:-}" log line cg
+
+  flux_log "capturing the state of this ${verdict} server before the restart destroys it"
+
+  if [ -n "${pid}" ]; then
+    flux_log "  process: pid=${pid} rss=$(($(flux_proc_status_field "${pid}" VmRSS) / 1024))M high-water=$(($(flux_proc_status_field "${pid}" VmHWM) / 1024))M virtual=$(($(flux_proc_status_field "${pid}" VmSize) / 1024))M threads=$(flux_proc_status_field "${pid}" Threads)"
+  else
+    flux_log "  process: gone before we could read it"
+  fi
+
+  if cg="$(flux_cgroup_memory)"; then
+    flux_log "  container memory: ${cg}"
+  else
+    flux_log "  container memory: no cgroup accounting visible from in here"
+  fi
+
+  [ -n "${skew}" ] && flux_log "  clock: the wall clock has moved ${skew}s more than the monotonic one since this generation started (ALLOW_NEGATIVE_DELTA_TIME is on, so a backwards step is tolerated rather than fatal)"
+
+  if flux_rest info; then
+    flux_log "  /v1/api/info said: ${FLUX_REST_BODY:0:${FLUX_GUARD_BODY_CHARS:-240}}"
+  else
+    flux_log "  /v1/api/info answered HTTP ${FLUX_REST_CODE}"
+  fi
+
+  if log="$(flux_newest_game_log)"; then
+    flux_log "  the last ${FLUX_FAULT_LOG_LINES} lines of ${log}:"
+    while IFS= read -r line; do
+      flux_log "  | ${line}"
+    done < <(tail -n "${FLUX_FAULT_LOG_LINES}" "${log}" 2>/dev/null | tr -d '\r')
+  else
+    flux_log "  no engine log under ${FLUX_GAME_LOG_DIR}: this build writes nothing there, so its [LOG] lines on stdout are all there is"
+  fi
+
   return 0
 }
 

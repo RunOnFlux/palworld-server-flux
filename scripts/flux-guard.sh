@@ -52,6 +52,10 @@ FLUX_GUARD_RESTART_DELAY="${FLUX_GUARD_RESTART_DELAY:-60}"
 # How much of the metrics body to keep for the log line on a bad sample. Enough
 # for the whole document a healthy server sends; short enough not to matter.
 FLUX_GUARD_BODY_CHARS="${FLUX_GUARD_BODY_CHARS:-240}"
+# Seconds of disagreement between the wall clock and the monotonic one, from one
+# sample to the next, before it is called a step and logged. Two seconds is well
+# clear of NTP slewing and of this loop's own jitter. 0 stops looking.
+FLUX_GUARD_CLOCK_SKEW="${FLUX_GUARD_CLOCK_SKEW:-2}"
 
 started_at="$(date -u +%s)"
 prev_uptime=""
@@ -73,6 +77,17 @@ GUARD_RSS_DROPPED=0
 # stays down until a full sample sees memory back above the line. Without that, a
 # fall the sample then calls healthy would wake us every few seconds forever.
 rss_wake_armed=1
+# The wall clock and the monotonic clock, as of the last sample, and how far apart
+# they have drifted since the first one. Every server we run sets
+# ALLOW_NEGATIVE_DELTA_TIME=true, which does not stop a host stepping its clock —
+# it stops the engine treating the step as fatal and leaves it running on whatever
+# state that produced. Nobody has ever looked at whether these nodes actually do
+# it, and two file reads a minute is what looking costs.
+wall_prev=""
+mono_prev=""
+wall_start=""
+mono_start=""
+clock_steps=0
 declare -A streak=([stalled]=0 [unresponsive]=0 [worldless]=0)
 
 # Collects one sample. Sets GUARD_VERDICT and GUARD_EVIDENCE, and updates the
@@ -174,6 +189,37 @@ flux_guard_sample() {
   return 0
 }
 
+# Reads both clocks and says so out loud when they disagree. Called once per
+# sample, right after it, so a step that lands next to a world unload is a line
+# next to a line rather than something to be inferred afterwards. It decides
+# nothing: a stepped clock is not by itself a fault, and no verdict reads this.
+flux_guard_check_clock() {
+  local wall mono skew
+  wall="$(date -u +%s)"
+  mono="$(flux_monotonic)"
+  if [ -z "${wall_prev}" ]; then
+    wall_start="${wall}"
+    mono_start="${mono}"
+  elif [ "${FLUX_GUARD_CLOCK_SKEW}" -gt 0 ] 2>/dev/null; then
+    skew="$(flux_clock_skew "$((wall - wall_prev))" "$((mono - mono_prev))")"
+    # ${skew#-} is the size of it, whichever way it went. Backwards is the one
+    # ALLOW_NEGATIVE_DELTA_TIME exists for; forwards is the same host doing the
+    # same thing and is worth the same line.
+    if [ "${skew#-}" -ge "${FLUX_GUARD_CLOCK_SKEW}" ] 2>/dev/null; then
+      clock_steps=$((clock_steps + 1))
+      flux_log "the host stepped its clock: the wall clock moved ${skew}s more than the monotonic one since the last sample (step ${clock_steps} this generation)"
+    fi
+  fi
+  wall_prev="${wall}"
+  mono_prev="${mono}"
+}
+
+# What the two clocks add up to over the whole generation, for the capture line.
+flux_guard_clock_drift() {
+  [ -n "${wall_start}" ] && [ -n "${wall_prev}" ] || { printf '0'; return; }
+  flux_clock_skew "$((wall_prev - wall_start))" "$((mono_prev - mono_start))"
+}
+
 # True when some verdict already has strikes against it. While that holds, the
 # wait between samples is left exactly as configured — bringing samples forward
 # inside a strike run would turn three strikes into fifteen seconds and hand a
@@ -226,6 +272,7 @@ while true; do
   [ -n "$(flux_game_pid)" ] || continue
 
   flux_guard_sample
+  flux_guard_check_clock
   [ "${GUARD_RSS_DROPPED}" = "1" ] || rss_wake_armed=1
   verdict="${GUARD_VERDICT}"
   evidence="${GUARD_EVIDENCE}"
@@ -308,6 +355,11 @@ while true; do
       continue
     fi
   fi
+
+  # Read the scene before disturbing it. Everything flux_capture_fault looks at
+  # dies with the process a second from now, and the verdict has already been
+  # reached — nothing it prints can change what happens next.
+  flux_capture_fault "${verdict}" "${GUARD_PID}" "$(flux_guard_clock_drift)"
 
   # The reason starts with the verdict on purpose: flux-entrypoint.sh reads it
   # back off the marker to decide whether this restart says anything is wrong with

@@ -243,6 +243,9 @@ if run_stub server -e FLUX_GUARD_FAILURES=2 -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_G
   check "and acted on without waiting for more of the same" \
     yes "$(saw 'the world is provably gone, so there is nobody to warn — restarting now')"
   check "no countdown is announced to an empty world" no "$(saw 'warning players and restarting in 4s')"
+  check "the scene is read before it is destroyed" \
+    yes "$(saw 'capturing the state of this worldless server')"
+  check "including what the API could still tell us" yes "$(saw '/v1/api/info said')"
   check "the server is killed" yes "$(saw 'sending SIGKILL to PalServer-Linux-Shipping')"
   check "and replaced in place" yes "$(saw 'starting the server (generation 2)')"
   check "the container never ended" true "$(docker inspect -f '{{.State.Running}}' ${CONTAINER})"

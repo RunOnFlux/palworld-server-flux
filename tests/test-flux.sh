@@ -387,6 +387,71 @@ check "no save yet" 0 "$(FLUX_SAVE_GLOB="${tmp}/SaveGames/0/*/Level.sav" flux_sa
 touch "${tmp}/SaveGames/0/ABCD/Level.sav"
 check "save on disk" 1 "$(FLUX_SAVE_GLOB="${tmp}/SaveGames/0/*/Level.sav" flux_save_present)"
 
+echo "flux_proc_status_field"
+# Same fixture the rss reader uses: one file, three fields, two of them not kB.
+check "reads the high-water mark" 7344700 \
+  "$(FLUX_PROC_ROOT=${tmp}/proc flux_proc_status_field 4242 VmPeak)"
+check "reads a field that is not a size" 42 \
+  "$(FLUX_PROC_ROOT=${tmp}/proc flux_proc_status_field 4242 Threads)"
+check "a field that is not there reads zero" 0 \
+  "$(FLUX_PROC_ROOT=${tmp}/proc flux_proc_status_field 4242 VmHWM)"
+check "a process that is not there reads zero" 0 \
+  "$(FLUX_PROC_ROOT=${tmp}/proc flux_proc_status_field 9999 VmRSS)"
+
+echo "flux_newest_game_log"
+logs="${tmp}/Logs"
+mkdir -p "${logs}"
+FLUX_GAME_LOG_DIR="${logs}" flux_newest_game_log >/dev/null 2>&1
+check "an empty log directory is no log" 1 "$?"
+touch -d '2026-08-30 03:00:00' "${logs}/Pal-backup-2026.08.30-03.00.00.log"
+touch -d '2026-08-31 13:50:00' "${logs}/Pal.log"
+touch -d '2026-08-31 14:00:00' "${logs}/Pal.txt"
+check "the newest .log wins, whatever it is called" "${logs}/Pal.log" \
+  "$(FLUX_GAME_LOG_DIR="${logs}" flux_newest_game_log)"
+FLUX_GAME_LOG_DIR="${tmp}/no-such-dir" flux_newest_game_log >/dev/null 2>&1
+check "a directory the engine never made is no log" 1 "$?"
+
+echo "flux_mib"
+check "bytes as megabytes" 2048M "$(flux_mib 2147483648)"
+check "zero is a reading like any other" 0M "$(flux_mib 0)"
+check "cgroup v2 says max when there is no limit" unlimited "$(flux_mib max)"
+check "cgroup v1 says it in page counters" unlimited "$(flux_mib 9223372036854771712)"
+check "and nothing at all is not a number either" unlimited "$(flux_mib "")"
+
+echo "flux_cgroup_memory"
+cg="${tmp}/cgroup"
+mkdir -p "${cg}"
+flux_cgroup_memory >/dev/null 2>&1
+check "no accounting visible is not an answer" 1 "$(FLUX_CGROUP_ROOT=${cg} flux_cgroup_memory >/dev/null 2>&1; echo $?)"
+printf '2076180480\n' >"${cg}/memory.current"
+printf '2147483648\n' >"${cg}/memory.max"
+printf 'low 0\nhigh 0\nmax 314\noom 2\noom_kill 1\n' >"${cg}/memory.events"
+# The question this exists to answer: was the container against its ceiling when
+# the world went, or nowhere near it.
+check "cgroup v2, including the counter that names an OOM" \
+  "current=1980M max=2048M oom=2 oom_kill=1" "$(FLUX_CGROUP_ROOT=${cg} flux_cgroup_memory)"
+rm -f "${cg}/memory.events"
+check "v2 without the events file still reports the ceiling" \
+  "current=1980M max=2048M oom=0 oom_kill=0" "$(FLUX_CGROUP_ROOT=${cg} flux_cgroup_memory)"
+mkdir -p "${cg}/memory"
+printf '2076180480\n' >"${cg}/memory/memory.usage_in_bytes"
+printf '9223372036854771712\n' >"${cg}/memory/memory.limit_in_bytes"
+printf '12\n' >"${cg}/memory/memory.failcnt"
+rm -f "${cg}/memory.current" "${cg}/memory.max"
+check "cgroup v1, where failcnt is the closest thing to an OOM count" \
+  "current=1980M max=unlimited failcnt=12" "$(FLUX_CGROUP_ROOT=${cg} flux_cgroup_memory)"
+
+echo "flux_monotonic / flux_clock_skew"
+printf '4368.42 8721.19\n' >"${tmp}/uptime"
+check "seconds since boot, whole" 4368 "$(FLUX_PROC_UPTIME=${tmp}/uptime flux_monotonic)"
+check "no /proc/uptime reads zero" 0 "$(FLUX_PROC_UPTIME=${tmp}/nope flux_monotonic)"
+# A clock that only ticks. Both deltas agree and there is nothing to report.
+check "two clocks that agree" 0 "$(flux_clock_skew 60 60)"
+# The one ALLOW_NEGATIVE_DELTA_TIME exists for: wall time went backwards while the
+# monotonic clock kept counting.
+check "the wall clock stepped backwards" -37 "$(flux_clock_skew 23 60)"
+check "and forwards" 40 "$(flux_clock_skew 100 60)"
+
 if [ "${failures}" -eq 0 ]; then
   echo "all tests passed"
 else
