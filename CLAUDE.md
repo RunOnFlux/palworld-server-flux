@@ -128,10 +128,21 @@ release (`vX.Y.Z` only, never `:latest`/`:dev`) when one appears. Needs
   `AUTO_REBOOT_ENABLED` and `REST_API_ENABLED` are true. The latter defaults to
   true in the image, and we do not set it — worth remembering before concluding a
   server should have been restarting.
+- **The game answers `/v1/api/stop` by aborting, not by exiting.** Signal 6, one
+  `crashinfo-*` directory, every time — confirmed by two dumps a day apart with the
+  same `PCallStackHash`. Before the polite stop existed, a dump on the volume meant
+  a real crash (a SIGKILL leaves none), so `flux_drop_stop_crash_dumps` removes the
+  ones we caused — those written after the restart marker's mtime — or ten a day
+  would push the real ones out of `FLUX_CRASH_KEEP`. It runs in PID 1, after the
+  sweep: the guard cannot do it, because the sweep kills the guard while the dump
+  is still being written.
 - The persistent volume is only `/palworld/Pal/Saved` (`containerData: g:/palworld/Pal/Saved`).
   Anything written elsewhere is gone on redeploy — and anything written *there* is
-  the customer's disk. `flux_prune_crash_dumps` is the only thing in here that
-  deletes: newest `FLUX_CRASH_KEEP` kept, `crashinfo-*` only, once per generation.
+  the customer's disk. Two things in here delete, and both keep the same shape —
+  one directory, one glob, a count said out loud in the log:
+  `flux_prune_crash_dumps` (newest `FLUX_CRASH_KEEP`, `crashinfo-*`, once per
+  generation) and `flux_drop_stop_crash_dumps` (only dumps written after we asked
+  the server to stop). Nothing else may.
 
 ## Related
 

@@ -497,6 +497,36 @@ check "two clocks that agree" 0 "$(flux_clock_skew 60 60)"
 check "the wall clock stepped backwards" -37 "$(flux_clock_skew 23 60)"
 check "and forwards" 40 "$(flux_clock_skew 100 60)"
 
+echo "flux_drop_stop_crash_dumps"
+# /v1/api/stop answers by aborting, which writes a dump. Ours are the ones written
+# after the second we asked; everything older is this world's own history and the
+# whole reason the directory is worth keeping.
+crashes="${tmp}/Crashes"
+setup_crashes() {
+  rm -rf "${crashes}"; mkdir -p "${crashes}"
+  mkdir -p "${crashes}/crashinfo-old" "${crashes}/crashinfo-ours" "${crashes}/not-a-crashinfo"
+  touch -d "@1000" "${crashes}/crashinfo-old"
+  touch -d "@2000" "${crashes}/crashinfo-ours"
+  touch -d "@2000" "${crashes}/not-a-crashinfo"
+}
+setup_crashes
+FLUX_CRASH_DIR="${crashes}" flux_drop_stop_crash_dumps 1500 >/dev/null
+check "the dump our own stop wrote is removed" 0 "$(find "${crashes}" -maxdepth 1 -name 'crashinfo-ours' | wc -l)"
+check "the ones that came before we asked are kept" 1 "$(find "${crashes}" -maxdepth 1 -name 'crashinfo-old' | wc -l)"
+check "and nothing else in the directory is ours to touch" 1 "$(find "${crashes}" -maxdepth 1 -name 'not-a-crashinfo' | wc -l)"
+
+setup_crashes
+FLUX_CRASH_DIR="${crashes}" flux_drop_stop_crash_dumps 0 >/dev/null
+check "a restart nobody asked for takes no blame" 2 "$(find "${crashes}" -maxdepth 1 -name 'crashinfo-*' | wc -l)"
+
+setup_crashes
+FLUX_CRASH_DIR="${crashes}" FLUX_CRASH_DROP_OWN=false flux_drop_stop_crash_dumps 1500 >/dev/null
+check "and it can be switched off" 2 "$(find "${crashes}" -maxdepth 1 -name 'crashinfo-*' | wc -l)"
+
+setup_crashes
+check "what went is named in the log" 1 \
+  "$(FLUX_CRASH_DIR="${crashes}" flux_drop_stop_crash_dumps 1500 | grep -c 'removed crashinfo-ours')"
+
 if [ "${failures}" -eq 0 ]; then
   echo "all tests passed"
 else

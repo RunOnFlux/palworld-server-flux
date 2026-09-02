@@ -279,6 +279,19 @@ save on disk is stamped before and after the attempt and a `WARN` names the
 off switch the first time a stop is caught writing. `FLUX_FORCE_STOP_WAIT=0` goes
 back to killing the process outright.
 
+What that stop costs, and who pays for it: **the game does not exit, it aborts**.
+It takes the request, shuts its REST API down and then raises signal 6, which
+writes a crash dump — two of them, taken a day apart, carry the same
+`PCallStackHash` and a `SecondsSinceStart` landing on the second we asked. That
+matters because of what it would bury. Before this image asked politely, a dump on
+the volume meant the game had crashed, since a `SIGKILL` cannot be caught and left
+none; a server restarting ten times a day now writes ten, and only the newest
+`FLUX_CRASH_KEEP` are kept, so a real crash dump would be gone inside two days. So
+the supervisor removes the ones we caused, and only those — a dump written after
+the moment we asked, which is the mtime of the restart marker — and names each one
+in the log, so the record outlives the directory. `FLUX_CRASH_DROP_OWN=false`
+keeps them.
+
 `docker stop` is the one case that is never followed by a restart. The signal is
 forwarded to `init.sh` so upstream's own SIGTERM handler saves the world, the
 supervisor records that it is stopping for good, and the container exits with
@@ -327,6 +340,7 @@ Everything upstream supports works unchanged. On top of it:
 | `FLUX_REBOOT_GRACEFUL_WAIT` | `90` | seconds the scheduled restart waits for the server to shut itself down |
 | `FLUX_GUARD_LOG` | `/palworld/Pal/Saved/flux-guard.log` | persistent log, capped at 2000 lines |
 | `FLUX_CRASH_KEEP` | `20` | crash dumps kept on the volume; the rest are deleted once per generation, `0` keeps them all |
+| `FLUX_CRASH_DROP_OWN` | `true` | remove the crash dump the game writes when it aborts in answer to our own `/v1/api/stop`, so it cannot push a real one out of `FLUX_CRASH_KEEP` |
 
 The log is written to the app volume on purpose: it is the only copy that survives
 the restart it describes, and the customer can read it from the dashboard's file

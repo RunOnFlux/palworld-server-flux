@@ -513,6 +513,46 @@ flux_capture_fault() {
   return 0
 }
 
+# --- the crash dumps our own stop leaves behind ------------------------------
+# /v1/api/stop does not exit cleanly. The game takes the request, shuts its REST
+# API down and then aborts: signal 6, one crashinfo directory, every single time.
+# Two dumps taken a day apart carry the same PCallStackHash and differ only in
+# where ASLR put libc, and their SecondsSinceStart lands on the second we asked.
+#
+# That matters because of what it buries. Before this image asked politely, a dump
+# on the volume meant the game had crashed; the old SIGKILL could not be caught and
+# left none. Now a server restarting ten times a day writes ten, and
+# flux_prune_crash_dumps keeps the newest twenty — so a real crash dump, the kind
+# worth reading, would be gone inside two days.
+#
+# So the ones we caused are removed, and only those: a dump is ours when it was
+# written after the moment we asked the server to stop, which is the mtime of the
+# restart marker. PID 1 does it, after the generation has ended — the guard cannot,
+# because the sweep kills it while the dump is still being written. What went is
+# named in the log, so the record outlives the directory.
+#
+# $1 the epoch second we asked; 0 or empty when this restart was not ours to blame
+FLUX_CRASH_DROP_OWN="${FLUX_CRASH_DROP_OWN:-true}"
+
+flux_drop_stop_crash_dumps() {
+  local requested_at="${1:-0}" removed=0 stamp dir
+  [ "${FLUX_CRASH_DROP_OWN,,}" = "true" ] || return 0
+  [ "${requested_at}" -gt 0 ] 2>/dev/null || return 0
+  [ -n "${FLUX_CRASH_DIR}" ] && [ -d "${FLUX_CRASH_DIR}" ] || return 0
+
+  while IFS="$(printf '\t')" read -r stamp dir; do
+    [ -n "${dir}" ] || continue
+    [ "${stamp%%.*}" -ge "${requested_at}" ] 2>/dev/null || continue
+    if rm -rf -- "${dir}" 2>/dev/null; then
+      removed=$((removed + 1))
+      flux_log "removed $(basename "${dir}"): written while we were stopping the server, so it is the abort our own /v1/api/stop causes and not a crash of this world"
+    fi
+  done < <(find "${FLUX_CRASH_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'crashinfo-*' \
+    -printf '%T@\t%p\n' 2>/dev/null)
+
+  return 0
+}
+
 # --- boot phase -------------------------------------------------------------
 # What a customer is waiting for, in four words, from the moment the container
 # starts until players can join.

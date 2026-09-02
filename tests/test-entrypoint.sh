@@ -82,6 +82,14 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length","2")
             self.end_headers()
             self.wfile.write(b"ok")
+            # The real game answers a stop by aborting, and the abort writes a
+            # crash dump. PID 1 has to tell that one from a crash of the world
+            # itself. No apostrophes in here: this block is inside a single
+            # quoted shell string, and one would end it.
+            try:
+                os.makedirs("/palworld/Pal/Saved/Crashes/crashinfo-stub-abort")
+            except OSError:
+                pass
             os.kill(int(os.environ["GAME_PID"]), 9)
             return
         self.send_error(404)
@@ -333,6 +341,30 @@ if run_stub server -e FLUX_GUARD_MIN_UPTIME=300 -e FLUX_GUARD_RESTART_DELAY=4; t
     yes "$(saw 'the world is provably gone, so there is nobody to warn — restarting now')"
   check "the generation is replaced" yes "$(saw 'starting the server (generation 2)')"
   check "the container never ended" true "$(docker inspect -f '{{.State.Running}}' ${CONTAINER})"
+fi
+
+# Two dumps a day apart carried the same PCallStackHash and a SecondsSinceStart
+# landing on the second we asked: /v1/api/stop does not exit, it aborts. Before
+# this image asked politely a dump on the volume meant the game had crashed — the
+# old SIGKILL could not be caught and left none — so ten polite restarts a day
+# would push a real crash dump out of the newest twenty inside two days.
+echo "the crash dump our own stop leaves behind"
+if run_stub server -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_GUARD_RESTART_DELAY=0 \
+  -e FLUX_FORCE_STOP_WAIT=15; then
+  wait_for "healthy for the first time" 30
+  docker exec "${CONTAINER}" sh -c 'mkdir -p /palworld/Pal/Saved/Crashes/crashinfo-older && touch -d @1000 /palworld/Pal/Saved/Crashes/crashinfo-older'
+  docker exec "${CONTAINER}" sh -c 'touch /tmp/honourstop'
+  docker exec "${CONTAINER}" sh -c 'printf "{\"serverfps\":0,\"currentplayernum\":0,\"uptime\":12,\"days\":0}" > /tmp/metrics.json'
+  wait_for "starting the server (generation 2)" 60
+  # First, that the stop is what ended it. Without this the assertion below passes
+  # for the wrong reason on a run where the game was killed instead: no stop, no
+  # abort, no dump, and nothing to find missing.
+  check "the stop is what ended the generation" yes "$(saw 'went down on its own after')"
+  check "the dump our own stop wrote is removed" 1 \
+    "$(docker exec ${CONTAINER} sh -c 'test -d /palworld/Pal/Saved/Crashes/crashinfo-stub-abort; echo $?')"
+  check "and said so by name" yes "$(saw 'removed crashinfo-stub-abort')"
+  check "this world's own history is kept" 0 \
+    "$(docker exec ${CONTAINER} sh -c 'test -d /palworld/Pal/Saved/Crashes/crashinfo-older; echo $?')"
 fi
 
 echo "a world that keeps unloading"

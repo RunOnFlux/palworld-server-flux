@@ -136,6 +136,7 @@ start_generation() {
   flux_seed_ini_if_missing
   resolve_admin_password
 
+
   # The marker means "the generation running right now has been asked to stop", so a
   # generation always starts without one. Without this line a marker written in the
   # gap between generations — a cron reboot that fires while the server is already
@@ -281,12 +282,20 @@ while true; do
   rc=$?
 
   reason=""
+  # When we asked, to the second. The game answers /v1/api/stop by aborting, and
+  # that abort writes a crash dump we would otherwise mistake — and prune — as this
+  # world's own. See flux_drop_stop_crash_dumps.
+  requested_at=0
   if [ -f "${FLUX_RESTART_MARKER}" ]; then
     reason="$(cat "${FLUX_RESTART_MARKER}" 2>/dev/null)"
+    requested_at="$(stat -c %Y "${FLUX_RESTART_MARKER}" 2>/dev/null || echo 0)"
     rm -f "${FLUX_RESTART_MARKER}"
   fi
 
   sweep_generation
+  # After the sweep: the dump is still being written while the generation ends, and
+  # the guard that asked for the stop is killed by the sweep itself.
+  flux_drop_stop_crash_dumps "${requested_at}"
 
   if [ "${terminating}" = "1" ]; then
     flux_log "stopped on request (init exited ${rc})"
