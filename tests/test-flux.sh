@@ -172,31 +172,42 @@ echo "flux_guard_wait"
 mkdir -p "${tmp}/proc/7777"
 rss_is() { printf 'VmRSS:\t %s kB\n' "$1" >"${tmp}/proc/7777/status"; }
 # Returns 0 on a normal wait and 1 when it came back early. Timed, because the
-# whole point is the wait it does not do.
+# whole point is the wait it does not do — but timed against the interval rather
+# than against an exact count of seconds. `date +%s` has one second of resolution,
+# so a two second sleep that starts at X.99 measures as three, and asserting the
+# exact number is a coin flip that a loaded CI runner eventually loses. What has to
+# be true is which side of the interval the wait came back on.
 waited_for() {
-  local t0 t1
+  local t0 t1 rc elapsed interval="$1"
   t0="$(date +%s)"
   FLUX_PROC_ROOT="${tmp}/proc" FLUX_GUARD_INTERVAL="$1" FLUX_GUARD_RSS_POLL="$2" \
     flux_guard_wait "$3" 7777 "${4:-3168996}" >/dev/null
-  local rc=$?
+  rc=$?
   t1="$(date +%s)"
-  printf '%s after %ss' "$([ "${rc}" = 0 ] && printf full || printf early)" "$((t1 - t0))"
+  elapsed=$((t1 - t0))
+  if [ "${rc}" = 0 ]; then
+    if [ "${elapsed}" -ge "${interval}" ]; then printf 'full'
+    else printf 'full, but back after only %ss of %ss' "${elapsed}" "${interval}"; fi
+  else
+    if [ "${elapsed}" -lt "${interval}" ]; then printf 'early'
+    else printf 'early, but took the whole %ss' "${elapsed}"; fi
+  fi
 }
 rss_is 3168996
-check "memory holding up waits the whole interval" "full after 3s" "$(waited_for 3 1 1)"
+check "memory holding up waits the whole interval" full "$(waited_for 3 1 1)"
 rss_is 1030908
-check "a collapse cuts the wait short" "early after 1s" "$(waited_for 6 1 1)"
-check "and is ignored when the wake is not armed" "full after 2s" "$(waited_for 2 1 0)"
-check "a poll at or above the interval is just a sleep" "full after 1s" "$(waited_for 1 5 1)"
-check "polling can be switched off entirely" "full after 1s" "$(waited_for 1 0 1)"
+check "a collapse cuts the wait short" early "$(waited_for 6 1 1)"
+check "and is ignored when the wake is not armed" full "$(waited_for 2 1 0)"
+check "a poll at or above the interval is just a sleep" full "$(waited_for 1 5 1)"
+check "polling can be switched off entirely" full "$(waited_for 1 0 1)"
 # The signal itself off means there is nothing to wake on, however fast we look.
-check "no memory signal, no early wake" "full after 2s" \
+check "no memory signal, no early wake" full \
   "$(FLUX_GUARD_RSS_DROP_KB=0 waited_for 2 1 1)"
 # A world that never grew big enough to lose a gigabyte cannot produce a collapse,
 # so the wait must not spend a single read looking for one.
-check "a peak too small to fall from is a plain sleep" "full after 2s" \
+check "a peak too small to fall from is a plain sleep" full \
   "$(waited_for 2 1 1 1500000)"
-check "and so is a generation with no peak yet" "full after 2s" \
+check "and so is a generation with no peak yet" full \
   "$(waited_for 2 1 1 0)"
 
 echo "flux_game_rss_kb"
