@@ -136,6 +136,11 @@ start_generation() {
   flux_seed_ini_if_missing
   resolve_admin_password
 
+  # Give the engine somewhere to write, and keep what it leaves behind bounded.
+  # Both are per generation because SteamCMD rewrites the launcher on every
+  # install and UE rotates the log on every launch.
+  flux_enable_engine_log
+  flux_prune_engine_logs
 
   # The marker means "the generation running right now has been asked to stop", so a
   # generation always starts without one. Without this line a marker written in the

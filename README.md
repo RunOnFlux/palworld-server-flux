@@ -140,6 +140,12 @@ disappear:
 
 - the last `FLUX_FAULT_LOG_LINES` lines of the engine's own log under
   `Pal/Saved/Logs`. Only its `[LOG]` lines reach stdout; that file has the rest.
+  The game does not write it on its own — its crash handler goes looking for
+  exactly that path and fails, every time — and upstream 2.7.3 has no way to pass
+  the `-log` that would make it, so this image adds the argument to the game's own
+  launcher once per generation (`FLUX_ENGINE_LOG`). UE rotates the previous log on
+  every launch, and a server that restarts ten times a day would leave ten
+  backups on the customer's volume, so the newest `FLUX_ENGINE_LOG_KEEP` are kept.
 - the process's own high-water mark, which the once-a-minute sampling can only
   approximate, alongside its resident, virtual and thread counts.
 - the container's memory ceiling and its OOM counters, from cgroup v2 or v1. A
@@ -341,6 +347,8 @@ Everything upstream supports works unchanged. On top of it:
 | `FLUX_GUARD_LOG` | `/palworld/Pal/Saved/flux-guard.log` | persistent log, capped at 2000 lines |
 | `FLUX_CRASH_KEEP` | `20` | crash dumps kept on the volume; the rest are deleted once per generation, `0` keeps them all |
 | `FLUX_CRASH_DROP_OWN` | `true` | remove the crash dump the game writes when it aborts in answer to our own `/v1/api/stop`, so it cannot push a real one out of `FLUX_CRASH_KEEP` |
+| `FLUX_ENGINE_LOG` | `true` | add `-log` to the game's launcher once per generation, so the engine writes `Pal/Saved/Logs/Pal.log` |
+| `FLUX_ENGINE_LOG_KEEP` | `5` | rotated engine logs kept on the volume, `0` keeps them all |
 
 The log is written to the app volume on purpose: it is the only copy that survives
 the restart it describes, and the customer can read it from the dashboard's file

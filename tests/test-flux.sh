@@ -497,6 +497,62 @@ check "two clocks that agree" 0 "$(flux_clock_skew 60 60)"
 check "the wall clock stepped backwards" -37 "$(flux_clock_skew 23 60)"
 check "and forwards" 40 "$(flux_clock_skew 100 60)"
 
+echo "flux_enable_engine_log"
+# The launcher SteamCMD installs, in the two shapes start.sh can hand us: the one
+# the game ships, and the arm64 copy it derives by prefixing box64. Every $ below
+# belongs to that file rather than to this one, which is what the disables say.
+# shellcheck disable=SC2016
+launch_line() {
+  printf '%s"$UE_PROJECT_ROOT/Pal/Binaries/Linux/PalServer-Linux-Shipping" Pal "$@"%s' "${1:-}" "${2:-}"
+}
+launcher="${tmp}/PalServer.sh"
+# shellcheck disable=SC2016
+write_launcher() {
+  printf '#!/bin/sh\nUE_PROJECT_ROOT="${0%%/*}"\n%s\n' "$(launch_line "${1:-}")" >"${launcher}"
+}
+last_line() { tail -1 "${launcher}"; }
+
+write_launcher
+flux_enable_engine_log "${launcher}" >/dev/null
+check "the argument lands at the end of the launch line" \
+  "$(launch_line '' ' -log')" "$(last_line)"
+# Applied once per generation, so it has to be a no-op on a launcher that has it.
+flux_enable_engine_log "${launcher}" >/dev/null
+check "and only once" "$(launch_line '' ' -log')" "$(last_line)"
+
+write_launcher 'LD_LIBRARY_PATH=/x /usr/local/bin/box64 '
+flux_enable_engine_log "${launcher}" >/dev/null
+check "the arm64 launcher is patched the same way" \
+  "$(launch_line 'LD_LIBRARY_PATH=/x /usr/local/bin/box64 ' ' -log')" "$(last_line)"
+
+write_launcher
+check "it can be switched off" "$(launch_line)" \
+  "$(FLUX_ENGINE_LOG=false flux_enable_engine_log "${launcher}" >/dev/null; last_line)"
+
+# A launcher of any other shape is somebody else's file. Say so and change nothing.
+printf '#!/bin/sh\necho not the launcher you are looking for\n' >"${launcher}"
+check "an unfamiliar launcher is left alone" 1 \
+  "$(flux_enable_engine_log "${launcher}" | grep -c 'WARN .* does not look like the launcher')"
+check "and really is left alone" 'echo not the launcher you are looking for' "$(last_line)"
+flux_enable_engine_log "${tmp}/no-such-launcher" >/dev/null
+check "a game that is not installed yet is not an error" 0 "$?"
+
+echo "flux_prune_engine_logs"
+logdir="${tmp}/EngineLogs"
+mkdir -p "${logdir}"
+for d in 01 02 03 04 05 06 07; do
+  touch -d "2026-09-${d} 10:00:00" "${logdir}/Pal-backup-2026.09.${d}-10.00.00.log"
+done
+touch "${logdir}/Pal.log" "${logdir}/notes.txt"
+FLUX_GAME_LOG_DIR="${logdir}" FLUX_ENGINE_LOG_KEEP=5 flux_prune_engine_logs >/dev/null
+check "the newest five backups are kept" 5 "$(find "${logdir}" -name 'Pal-backup-*.log' | wc -l)"
+check "and they are the newest ones" 1 "$(find "${logdir}" -name 'Pal-backup-2026.09.07-*' | wc -l)"
+check "the oldest is gone" 0 "$(find "${logdir}" -name 'Pal-backup-2026.09.01-*' | wc -l)"
+check "the live log is never touched" 1 "$(find "${logdir}" -name 'Pal.log' | wc -l)"
+check "nor is anything that is not an engine log" 1 "$(find "${logdir}" -name 'notes.txt' | wc -l)"
+FLUX_GAME_LOG_DIR="${logdir}" FLUX_ENGINE_LOG_KEEP=0 flux_prune_engine_logs >/dev/null
+check "keeping them all is a valid answer" 5 "$(find "${logdir}" -name 'Pal-backup-*.log' | wc -l)"
+
 echo "flux_drop_stop_crash_dumps"
 # /v1/api/stop answers by aborting, which writes a dump. Ours are the ones written
 # after the second we asked; everything older is this world's own history and the

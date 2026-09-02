@@ -513,6 +513,76 @@ flux_capture_fault() {
   return 0
 }
 
+# --- the engine's own log ----------------------------------------------------
+# The game writes nothing under Pal/Saved/Logs, which is why every capture so far
+# has had a hole where its most useful line should be. It is not that the engine
+# has no log to give: its own crash handler goes looking for exactly that file and
+# fails, in the same breath, every time —
+#
+#   ERROR FILE_IO_POSIX.CC:145] open /palworld/Pal/Saved/Logs/Pal.log
+#   ERROR CRASH_REPORT_EXCEPTION_HANDLER.CC:284] attachment /palworld/Pal/Saved/Logs/Pal.log
+#
+# UE writes it when the server is launched with -log, and upstream 2.7.3 has no way
+# to add an argument: start.sh assembles STARTCOMMAND from a fixed list of env
+# vars (PORT, QUERY_PORT, COMMUNITY, PALWORLD_ALLOW_NEGATIVE_DELTA_TIME, the
+# threading pair, ENABLE_GAMEDATA_API) and stops. An EXTRA_ARGS upstream is the
+# right home for this and is worth a PR, the way the admin password was; until
+# then the argument goes on the game's own launcher shim.
+#
+# PalServer.sh is a five line wrapper around the binary and SteamCMD rewrites it on
+# every install, so this is applied once per generation and is a no-op on the ones
+# that already have it. Nothing is written to the persistent volume and nothing
+# survives a redeploy. It only patches the single line that ends with the game's
+# own argument list, so a launcher of any other shape is left exactly as it is —
+# including the arm64 copy start.sh derives from it, which is built from this one.
+#
+# The one generation it cannot help is the first of a brand new container: the game
+# is not on disk yet at that point, because init.sh is what installs it.
+FLUX_ENGINE_LOG="${FLUX_ENGINE_LOG:-true}"
+
+flux_enable_engine_log() {
+  local launcher="${1:-${FLUX_GAME_LAUNCHER}}"
+  [ "${FLUX_ENGINE_LOG,,}" = "true" ] || return 0
+  [ -f "${launcher}" ] || return 0
+  # Only on the launch line, and only as its own argument: a bare "-log" would also
+  # be found inside something like --login, in a launcher we have never seen.
+  if grep -q 'PalServer-Linux-Shipping.* -log\( \|$\)' "${launcher}" 2>/dev/null; then
+    return 0
+  fi
+  if ! grep -q 'PalServer-Linux-Shipping' "${launcher}" 2>/dev/null; then
+    flux_log "WARN ${launcher} does not look like the launcher we know; leaving it alone, so there will be no engine log"
+    return 0
+  fi
+  if sed -i '/PalServer-Linux-Shipping/ s|\( Pal "\$@"\)$|\1 -log|' "${launcher}" 2>/dev/null &&
+     grep -q 'PalServer-Linux-Shipping.* -log\( \|$\)' "${launcher}" 2>/dev/null; then
+    flux_log "added -log to ${launcher}, so the engine writes ${FLUX_GAME_LOG_DIR}/Pal.log for this generation"
+  else
+    flux_log "WARN could not add -log to ${launcher}; the engine will go on writing no log"
+  fi
+  return 0
+}
+
+# UE renames the previous Pal.log out of the way on every launch, and this image
+# starts a generation several times a day onto a volume the customer pays for. Same
+# shape and same discipline as flux_prune_crash_dumps: newest kept, one glob, one
+# directory, and the count said out loud. 0 keeps them all.
+FLUX_ENGINE_LOG_KEEP="${FLUX_ENGINE_LOG_KEEP:-5}"
+
+flux_prune_engine_logs() {
+  local keep="${FLUX_ENGINE_LOG_KEEP}" removed=0 f
+  [ "${keep}" -gt 0 ] 2>/dev/null || return 0
+  [ -n "${FLUX_GAME_LOG_DIR}" ] && [ -d "${FLUX_GAME_LOG_DIR}" ] || return 0
+
+  while IFS= read -r f; do
+    [ -n "${f}" ] || continue
+    rm -f -- "${f}" 2>/dev/null && removed=$((removed + 1))
+  done < <(find "${FLUX_GAME_LOG_DIR}" -mindepth 1 -maxdepth 1 -type f -name 'Pal-backup-*.log' \
+    -printf '%T@\t%p\n' 2>/dev/null | sort -rn | tail -n "+$((keep + 1))" | cut -f2-)
+
+  [ "${removed}" -gt 0 ] && flux_log "pruned ${removed} old engine log(s) from ${FLUX_GAME_LOG_DIR}, keeping the newest ${keep}"
+  return 0
+}
+
 # --- the crash dumps our own stop leaves behind ------------------------------
 # /v1/api/stop does not exit cleanly. The game takes the request, shuts its REST
 # API down and then aborts: signal 6, one crashinfo directory, every single time.

@@ -353,6 +353,8 @@ if run_stub server -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_GUARD_RESTART_DELAY=0 \
   -e FLUX_FORCE_STOP_WAIT=15; then
   wait_for "healthy for the first time" 30
   docker exec "${CONTAINER}" sh -c 'mkdir -p /palworld/Pal/Saved/Crashes/crashinfo-older && touch -d @1000 /palworld/Pal/Saved/Crashes/crashinfo-older'
+  # The launcher SteamCMD would have installed, which this stub never runs.
+  docker exec "${CONTAINER}" sh -c 'printf "#!/bin/sh\n\"\$UE_PROJECT_ROOT/Pal/Binaries/Linux/PalServer-Linux-Shipping\" Pal \"\$@\"\n" > /palworld/PalServer.sh'
   docker exec "${CONTAINER}" sh -c 'touch /tmp/honourstop'
   docker exec "${CONTAINER}" sh -c 'printf "{\"serverfps\":0,\"currentplayernum\":0,\"uptime\":12,\"days\":0}" > /tmp/metrics.json'
   wait_for "starting the server (generation 2)" 60
@@ -365,6 +367,8 @@ if run_stub server -e FLUX_GUARD_MIN_UPTIME=0 -e FLUX_GUARD_RESTART_DELAY=0 \
   check "and said so by name" yes "$(saw 'removed crashinfo-stub-abort')"
   check "this world's own history is kept" 0 \
     "$(docker exec ${CONTAINER} sh -c 'test -d /palworld/Pal/Saved/Crashes/crashinfo-older; echo $?')"
+  check "and the next generation gets an engine log" \
+    yes "$(saw 'added -log to /palworld/PalServer.sh')"
 fi
 
 echo "a world that keeps unloading"

@@ -136,13 +136,21 @@ release (`vX.Y.Z` only, never `:latest`/`:dev`) when one appears. Needs
   would push the real ones out of `FLUX_CRASH_KEEP`. It runs in PID 1, after the
   sweep: the guard cannot do it, because the sweep kills the guard while the dump
   is still being written.
+- **The engine writes no log unless we ask for it.** `-log` goes onto the game's
+  own `PalServer.sh` once per generation (`flux_enable_engine_log`), because
+  upstream 2.7.3 builds `STARTCOMMAND` from a fixed list of env vars with no hook
+  for an extra argument — an `EXTRA_ARGS` upstream is where this belongs, the way
+  the admin password was. SteamCMD rewrites that launcher on every install, so the
+  patch is per generation and idempotent, and the first generation of a brand new
+  container cannot have it (the game is not on disk yet).
 - The persistent volume is only `/palworld/Pal/Saved` (`containerData: g:/palworld/Pal/Saved`).
   Anything written elsewhere is gone on redeploy — and anything written *there* is
-  the customer's disk. Two things in here delete, and both keep the same shape —
-  one directory, one glob, a count said out loud in the log:
+  the customer's disk. Three things in here delete, and all three keep the same
+  shape — one directory, one glob, a count said out loud in the log:
   `flux_prune_crash_dumps` (newest `FLUX_CRASH_KEEP`, `crashinfo-*`, once per
-  generation) and `flux_drop_stop_crash_dumps` (only dumps written after we asked
-  the server to stop). Nothing else may.
+  generation), `flux_prune_engine_logs` (newest `FLUX_ENGINE_LOG_KEEP`,
+  `Pal-backup-*.log`, never the live `Pal.log`) and `flux_drop_stop_crash_dumps`
+  (only dumps written after we asked the server to stop). Nothing else may.
 
 ## Related
 
