@@ -142,7 +142,12 @@ release (`vX.Y.Z` only, never `:latest`/`:dev`) when one appears. Needs
   for an extra argument — an `EXTRA_ARGS` upstream is where this belongs, the way
   the admin password was. SteamCMD rewrites that launcher on every install, so the
   patch is per generation and idempotent, and the first generation of a brand new
-  container cannot have it (the game is not on disk yet).
+  container cannot have it (the game is not on disk yet). **Never anchor on the tail
+  of the launch line.** The first version matched ` Pal "$@"` at end of line and was
+  a silent no-op on every real server for a day — upstream's own arm64 sed matches
+  that same substring unanchored, which is the shape to copy. The switch now goes in
+  behind the launcher's `"$@"`, and the WARN names the line it could not patch and
+  whether the file was writable, because those two failures used to read alike.
 - The persistent volume is only `/palworld/Pal/Saved` (`containerData: g:/palworld/Pal/Saved`).
   Anything written elsewhere is gone on redeploy — and anything written *there* is
   the customer's disk. Three things in here delete, and all three keep the same

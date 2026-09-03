@@ -519,7 +519,7 @@ launch_line() {
 launcher="${tmp}/PalServer.sh"
 # shellcheck disable=SC2016
 write_launcher() {
-  printf '#!/bin/sh\nUE_PROJECT_ROOT="${0%%/*}"\n%s\n' "$(launch_line "${1:-}")" >"${launcher}"
+  printf '#!/bin/sh\nUE_PROJECT_ROOT="${0%%/*}"\n%s\n' "$(launch_line "${1:-}" "${2:-}")" >"${launcher}"
 }
 last_line() { tail -1 "${launcher}"; }
 
@@ -539,6 +539,37 @@ check "the arm64 launcher is patched the same way" \
 write_launcher
 check "it can be switched off" "$(launch_line)" \
   "$(FLUX_ENGINE_LOG=false flux_enable_engine_log "${launcher}" >/dev/null; last_line)"
+
+# The tail of the launch line is the game's to change, and matching on it is what
+# made the first version of this a silent no-op on every real server. Trailing
+# whitespace is a tail like any other: it hides nothing and it is not disturbed.
+write_launcher '' '   '
+flux_enable_engine_log "${launcher}" >/dev/null
+check "trailing whitespace does not hide the launch line" \
+  "$(launch_line '' ' -log   ')" "$(last_line)"
+
+# Whatever the game puts after its argument list, the switch belongs to the game
+# and has to land in front of it — which is where upstream's own arm64 sed anchors.
+write_launcher '' ' >/dev/null 2>&1'
+flux_enable_engine_log "${launcher}" >/dev/null
+check "a tail after the argument list keeps its place" \
+  "$(launch_line '' ' -log >/dev/null 2>&1')" "$(last_line)"
+
+# shellcheck disable=SC2016
+printf '#!/bin/sh\nchmod +x "$R/Pal/Binaries/Linux/PalServer-Linux-Shipping"\n"$R/Pal/Binaries/Linux/PalServer-Linux-Shipping" Pal -someday\n' >"${launcher}"
+flux_enable_engine_log "${launcher}" >/dev/null
+# shellcheck disable=SC2016
+check "a launch line with no argument list still gets the switch" \
+  '"$R/Pal/Binaries/Linux/PalServer-Linux-Shipping" Pal -someday -log' "$(last_line)"
+# shellcheck disable=SC2016
+check "and the chmod above it is not the launch line" \
+  'chmod +x "$R/Pal/Binaries/Linux/PalServer-Linux-Shipping"' "$(sed -n 2p "${launcher}")"
+
+# A launcher that only ever names the binary to chmod it runs nothing.
+# shellcheck disable=SC2016
+printf '#!/bin/sh\nchmod +x "$R/Pal/Binaries/Linux/PalServer-Linux-Shipping"\n' >"${launcher}"
+check "a launcher that never runs the binary is left alone" 1 \
+  "$(flux_enable_engine_log "${launcher}" | grep -c 'WARN .* does not look like the launcher')"
 
 # A launcher of any other shape is somebody else's file. Say so and change nothing.
 printf '#!/bin/sh\necho not the launcher you are looking for\n' >"${launcher}"

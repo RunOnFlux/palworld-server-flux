@@ -532,32 +532,67 @@ flux_capture_fault() {
 # PalServer.sh is a five line wrapper around the binary and SteamCMD rewrites it on
 # every install, so this is applied once per generation and is a no-op on the ones
 # that already have it. Nothing is written to the persistent volume and nothing
-# survives a redeploy. It only patches the single line that ends with the game's
-# own argument list, so a launcher of any other shape is left exactly as it is —
-# including the arm64 copy start.sh derives from it, which is built from this one.
+# survives a redeploy. It patches the one line that runs the binary — the chmod
+# above it is the only other line naming it — and appends to that line as it comes
+# rather than matching the tail the game happens to ship, which is what the first
+# version did and what made it a no-op on every real server. A launcher that runs
+# the binary nowhere is left exactly as it is; the arm64 copy start.sh derives by
+# prefixing box64 is patched like any other.
 #
 # The one generation it cannot help is the first of a brand new container: the game
 # is not on disk yet at that point, because init.sh is what installs it.
 FLUX_ENGINE_LOG="${FLUX_ENGINE_LOG:-true}"
 
 flux_enable_engine_log() {
-  local launcher="${1:-${FLUX_GAME_LAUNCHER}}"
+  local launcher="${1:-${FLUX_GAME_LAUNCHER}}" line tmp
   [ "${FLUX_ENGINE_LOG,,}" = "true" ] || return 0
   [ -f "${launcher}" ] || return 0
   # Only on the launch line, and only as its own argument: a bare "-log" would also
   # be found inside something like --login, in a launcher we have never seen.
-  if grep -q 'PalServer-Linux-Shipping.* -log\( \|$\)' "${launcher}" 2>/dev/null; then
+  if grep -q 'PalServer-Linux-Shipping.* -log\([[:space:]]\|$\)' "${launcher}" 2>/dev/null; then
     return 0
   fi
-  if ! grep -q 'PalServer-Linux-Shipping' "${launcher}" 2>/dev/null; then
+  # The launch line is the one that runs the binary. The chmod above it names the
+  # binary too, which is the only other line in the file that does.
+  line="$(grep -v '^[[:space:]]*chmod\b' "${launcher}" 2>/dev/null |
+    grep -m1 'PalServer-Linux-Shipping')"
+  if [ -z "${line}" ]; then
     flux_log "WARN ${launcher} does not look like the launcher we know; leaving it alone, so there will be no engine log"
     return 0
   fi
-  if sed -i '/PalServer-Linux-Shipping/ s|\( Pal "\$@"\)$|\1 -log|' "${launcher}" 2>/dev/null &&
-     grep -q 'PalServer-Linux-Shipping.* -log\( \|$\)' "${launcher}" 2>/dev/null; then
+
+  # Appended behind the launcher's own `"$@"`, which is where upstream's arm64 sed
+  # anchors too, and at the end of the line only if there is no `"$@"` to sit behind.
+  # The first version of this matched ` Pal "$@"` anchored at the end of the line and
+  # was a no-op on every real server, so whatever the game now puts after its
+  # argument list, nothing here may depend on knowing it. The failure branch names
+  # the line and says whether the file was writable, because a launcher that does
+  # not match and one that cannot be written read the same from the log.
+  #
+  # Written back through the file rather than over it (no `sed -i`, no rename), so
+  # the mode and ownership SteamCMD gave it survive.
+  tmp="${launcher}.flux-tmp"
+  if awk '
+      !patched && /PalServer-Linux-Shipping/ && $1 != "chmod" {
+        i = index($0, "\"$@\"")
+        if (i > 0) {
+          print substr($0, 1, i + 3) " -log" substr($0, i + 4)
+        } else {
+          sub(/[[:space:]]+$/, "")
+          print $0 " -log"
+        }
+        patched = 1
+        next
+      }
+      { print }
+    ' "${launcher}" >"${tmp}" 2>/dev/null &&
+     grep -q 'PalServer-Linux-Shipping.* -log\([[:space:]]\|$\)' "${tmp}" 2>/dev/null &&
+     cat "${tmp}" >"${launcher}" 2>/dev/null; then
+    rm -f "${tmp}"
     flux_log "added -log to ${launcher}, so the engine writes ${FLUX_GAME_LOG_DIR}/Pal.log for this generation"
   else
-    flux_log "WARN could not add -log to ${launcher}; the engine will go on writing no log"
+    rm -f "${tmp}"
+    flux_log "WARN could not add -log to ${launcher} (running as $(id -un 2>/dev/null), file $([ -w "${launcher}" ] && printf writable || printf 'not writable'), launch line: ${line}); the engine will go on writing no log"
   fi
   return 0
 }
