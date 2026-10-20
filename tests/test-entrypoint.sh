@@ -220,6 +220,16 @@ if run_stub ignore; then
   check "the wedged generation is forced down" yes "$(saw 'still winding down; forcing this generation to end')"
   check "a fresh server is started in place" yes "$(saw 'starting the server (generation 2)')"
   check "the container never ended" true "$(docker inspect -f '{{.State.Running}}' ${CONTAINER})"
+  # flux.log is on a container path that is no volume, and the FluxCloud banner is printed
+  # at the container start and again for each generation.
+  check "flux.log is at /var/log/flux" 0 "$(docker exec "${CONTAINER}" test -s /var/log/flux/flux.log; echo $?)"
+  check "and not on the synced volume" 1 "$(docker exec "${CONTAINER}" test -e /palworld/Pal/Saved/flux-guard.log; echo $?)"
+  check "the banner is in the container output" yes \
+    "$(logs | grep -q 'Palworld server image by FluxCloud - https://runonflux.com' && echo yes || echo no)"
+  check "and in flux.log" yes \
+    "$(docker exec "${CONTAINER}" grep -q 'Host this and 30+ other games in one click: https://runonflux.com/games' /var/log/flux/flux.log && echo yes || echo no)"
+  check "at the container start and again for each generation" yes \
+    "$([ "$(logs | grep -c 'server image by FluxCloud')" -ge 2 ] && echo yes || echo no)"
   # A marker that outlives the generation it belonged to killed a healthy server on a
   # real box: a scheduled restart fired in the gap between two generations, found
   # nothing to stop, and left the request behind for the next one to obey.

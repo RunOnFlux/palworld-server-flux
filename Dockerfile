@@ -17,6 +17,13 @@ FROM thijsvanloef/palworld-server-docker:${PALWORLD_VERSION}
 ARG PALWORLD_VERSION=v2.7.2
 ARG FLUX_IMAGE_VERSION=dev
 
+# The base is a release tag, not a digest, and its Debian packages age between upstream releases.
+# The scheduled CI check (.github/ci/needs-rebuild.sh) looks at what this upgrade would apply to
+# the published image and rebuilds early for a security update to a package the server runs on.
+RUN apt-get update -y && \
+    apt-get upgrade -y --no-install-recommends && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 COPY scripts/flux-lib.sh scripts/flux-guard.sh scripts/flux-reboot.sh scripts/flux-entrypoint.sh /home/steam/server/
 
 # The game's own sample settings file, used only to build the very first

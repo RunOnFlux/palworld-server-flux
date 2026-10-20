@@ -344,15 +344,21 @@ Everything upstream supports works unchanged. On top of it:
 | `FLUX_STOP_GRACE` | `90` | seconds a generation may spend winding down after `docker stop`, when the server that was running when the signal arrived is still up and may be saving |
 | `FLUX_STOP_GRACE_IDLE` | `30` | the same deadline when there is no such server left to wait for |
 | `FLUX_REBOOT_GRACEFUL_WAIT` | `90` | seconds the scheduled restart waits for the server to shut itself down |
-| `FLUX_GUARD_LOG` | `/palworld/Pal/Saved/flux-guard.log` | persistent log, capped at 2000 lines |
+| `FLUX_LOG` | `/var/log/flux/flux.log` | our log (the guard, the supervisor, the scheduled restart); 5 MB, then one `.1` copy. Empty turns the file off (stdout stays) |
+| `FLUX_LOG_MAX_BYTES` | `5242880` | the size at which `flux.log` becomes `flux.log.1` |
 | `FLUX_CRASH_KEEP` | `20` | crash dumps kept on the volume; the rest are deleted once per generation, `0` keeps them all |
 | `FLUX_CRASH_DROP_OWN` | `true` | remove the crash dump the game writes when it aborts in answer to our own `/v1/api/stop`, so it cannot push a real one out of `FLUX_CRASH_KEEP` |
 | `FLUX_ENGINE_LOG` | `true` | add `-log` to the game's launcher once per generation, so the engine writes `Pal/Saved/Logs/Pal.log` |
 | `FLUX_ENGINE_LOG_KEEP` | `5` | rotated engine logs kept on the volume, `0` keeps them all |
 
-The log is written to the app volume on purpose: it is the only copy that survives
-the restart it describes, and the customer can read it from the dashboard's file
-browser.
+The log is NOT on the app volume: the guard writes it about once a minute, and on the
+synced `g:` volume that is constant Syncthing traffic. The spec has no `ml:` mount, so it
+lives in `/var/log/flux/`, a container path that is no volume. It survives the in-place
+restarts it describes (the writable layer stays) and a restart of the container; it is lost
+when the platform recreates the container (a redeploy). Read it with the dashboard's console
+or `docker exec <container> cat /var/log/flux/flux.log`. A `flux-guard.log` an older image left
+on the volume is appended to it once at start and deleted. The FluxCloud start-up banner
+(runonflux.com/games) is printed at the container start and for every generation.
 
 **The defaults are the live ones.** A spec that sets none of these still gets a
 probe that restarts servers automatically: the values above are baked into the
@@ -362,7 +368,7 @@ and `FLUX_GUARD_ENABLED=false` switches the probe off entirely, which it says in
 the log rather than doing silently.
 
 Everything the probe does is written both to the container's stdout (so it is in
-`docker logs`, and in the dashboard's console tab) and to the persistent log. The
+`docker logs`, and in the dashboard's console tab) and to `flux.log`. The
 lines are not filtered by upstream's `LOG_FILTER_ENABLED` pipeline: the probe is a
 child of PID 1, not of `init.sh`, so its output goes straight out. A full recovery
 reads like this:
@@ -426,16 +432,22 @@ a world unload. That last one fails against the code as it was.
 releases only (`vX.Y.Z`). Upstream's `:latest` and `:dev` move whenever their main
 branch moves; a Flux app pinned to a rolling tag gets rebuilt onto unreleased code
 and every customer's server restarted with it. The workflow reads the newest
-stable tag daily, compares it with the `org.opencontainers.image.base.version`
-label on our published image, and only builds when there is something new. A push
-to `main` always builds. Pull requests run the tests and publish nothing.
+stable tag once a week (Monday), and a scheduled run builds only when there is
+something to apply (`.github/ci/needs-rebuild.sh`), because every new `:latest` restarts
+every server running it: (1) a newer stable release than the
+`org.opencontainers.image.base.version` label on our published image, (2) a security
+update waiting in the published image for a package the server runs on (the Dockerfile
+runs `apt-get upgrade`), or (3) commits on `main` touching the image inputs that the
+published image's `org.opencontainers.image.revision` label does not have. Anything
+else waits for the first Monday of the month. A push to `main` or a manual run always
+builds. Pull requests run the tests and publish nothing.
 
 Needs `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as repository secrets.
 
 ## Rolling it out
 
 1. Build, then run a server on the new image with `FLUX_GUARD_DRY_RUN=true` and
-   read `flux-guard.log` for a few days. False positives are the only real risk
+   read `flux.log` (or the container output) for a few days. False positives are the only real risk
    here, and dry run is how you find them without restarting anyone.
 2. Point the marketplace app spec at the new image. New deploys only.
 3. Existing servers need their own spec updated, which only the app owner can

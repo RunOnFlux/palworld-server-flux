@@ -55,11 +55,16 @@ FLUX_STOP_GRACE_IDLE="${FLUX_STOP_GRACE_IDLE:-30}"
 # writable layer is not recreated), so clear it before anything else.
 rm -f "${FLUX_RESTART_MARKER}"
 
-# The persistent log lives on the app volume. Create it before writing into it and
-# hand it to the user init.sh chowns the volume to.
-if [ -d "$(dirname "${FLUX_GUARD_LOG}")" ]; then
-  touch "${FLUX_GUARD_LOG}" 2>/dev/null && chown "${PUID:-1000}:${PGID:-1000}" "${FLUX_GUARD_LOG}" 2>/dev/null
+# flux.log is on a container path outside every volume (see flux-lib.sh). Create it before writing
+# into it and make it writable for the user init.sh runs the game as (the guard and the scheduled
+# reboot may run as either). A flux-guard.log an older image left on the synced volume is moved
+# into it, once.
+if [ -n "${FLUX_LOG}" ] && mkdir -p "$(dirname "${FLUX_LOG}")" 2>/dev/null; then
+  chmod 1777 "$(dirname "${FLUX_LOG}")" 2>/dev/null
+  touch "${FLUX_LOG}" 2>/dev/null && chmod 0666 "${FLUX_LOG}" 2>/dev/null
 fi
+flux_log_migrate "${FLUX_OLD_GUARD_LOG}"
+flux_banner "Palworld"
 
 flux_log "flux-entrypoint starting (image ${FLUX_IMAGE_VERSION:-unknown}, base ${FLUX_BASE_VERSION:-unknown}, restart mode ${FLUX_RESTART_MODE})"
 flux_log "$(flux_crash_dump_count) crash dump(s) on the volume from previous lives of this world"
@@ -149,6 +154,7 @@ start_generation() {
   # deadline watcher below kills a perfectly healthy server sixty seconds after it
   # came up. Seen happening on a real server.
   rm -f "${FLUX_RESTART_MARKER}"
+  flux_banner "Palworld"
   flux_log "starting the server (generation ${generation})"
 
   # Its own process group, so a generation can be swept whole. Without it, a

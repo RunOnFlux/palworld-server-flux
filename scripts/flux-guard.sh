@@ -245,7 +245,7 @@ flux_guard_message() {
 
 # --- one-shot mode (docker HEALTHCHECK) -------------------------------------
 if [ "${1:-}" = "--check" ]; then
-  FLUX_GUARD_LOG=""   # a health check must not write to the customer's volume
+  FLUX_LOG=""   # a health check writes no log of its own (it runs every minute)
   flux_guard_sample
   printf '%s %s\n' "${GUARD_VERDICT}" "${GUARD_EVIDENCE}"
   [ "${GUARD_VERDICT}" = "ok" ]
@@ -283,7 +283,6 @@ while true; do
       flux_log "server healthy for the first time this boot (${evidence})"
     fi
     for k in "${!streak[@]}"; do streak[$k]=0; done
-    flux_log_rotate
     continue
   fi
 

@@ -50,6 +50,16 @@ release (`vX.Y.Z` only, never `:latest`/`:dev`) when one appears. Needs
 
 ## Things that will bite you
 
+- **`flux.log` is local, not on the volume.** `/var/log/flux/flux.log` (a container path, no `ml:`
+  mount in the spec; 5 MB then one `.1`): the guard writes it every minute and the synced `g:`
+  volume would carry that as constant traffic. It is lost when the platform recreates the
+  container, kept across in-place restarts. `flux_log_migrate` moves an old
+  `Saved/flux-guard.log` off the volume at start; `flux_banner` prints the FluxCloud banner at
+  container start and every generation (text tested). `FLUX_GUARD_LOG` no longer exists.
+- **The scheduled CI run (Mondays) publishes only with something to apply**
+  (`.github/ci/needs-rebuild.sh`): a new stable upstream release, an urgent Debian security
+  update (the Dockerfile `apt-get upgrade`s the base), or commits on main touching the image
+  inputs that the published `:latest` (label `org.opencontainers.image.revision`) lacks.
 - **`flux_classify` is pure on purpose.** Every input is an argument; it reads
   nothing from the system. That is what makes the whole decision table testable.
   Keep it that way, and add a case to `tests/test-flux.sh` for every rule change.

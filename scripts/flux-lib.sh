@@ -13,14 +13,19 @@
 # problem.
 
 # --- paths ------------------------------------------------------------------
-# On Flux only /palworld/Pal/Saved is a persistent volume (the app spec mounts
-# `g:/palworld/Pal/Saved`). Everything else in the image is the container's
-# writable layer and is thrown away on a redeploy, so the guard's log lives under
-# Saved, where it also shows up in the dashboard's file browser.
+# On Flux only /palworld/Pal/Saved is a mounted volume (the app spec mounts
+# `g:/palworld/Pal/Saved`, synced), and there is no `ml:` mount. Everything else in the image is
+# the container's writable layer. flux.log is written about once a minute by the guard, so it is
+# NOT on the synced volume (constant Syncthing traffic): it lives in /var/log/flux, a container path
+# that is not a volume. That layer survives an in-container restart and a docker restart of the
+# container, and is lost only when the platform recreates it (a redeploy).
 FLUX_SETTINGS_INI="${FLUX_SETTINGS_INI:-/palworld/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini}"
 FLUX_SAVE_GLOB="${FLUX_SAVE_GLOB:-/palworld/Pal/Saved/SaveGames/0/*/Level.sav}"
-FLUX_GUARD_LOG="${FLUX_GUARD_LOG:-/palworld/Pal/Saved/flux-guard.log}"
-FLUX_GUARD_LOG_MAX_LINES="${FLUX_GUARD_LOG_MAX_LINES:-2000}"
+FLUX_LOG_DIR="${FLUX_LOG_DIR:-/var/log/flux}"
+FLUX_LOG="${FLUX_LOG-${FLUX_LOG_DIR}/flux.log}"
+FLUX_LOG_MAX_BYTES="${FLUX_LOG_MAX_BYTES:-5242880}"
+# Where earlier images kept the log, on the synced volume: moved to FLUX_LOG once, at start.
+FLUX_OLD_GUARD_LOG="${FLUX_OLD_GUARD_LOG:-/palworld/Pal/Saved/flux-guard.log}"
 
 # Written by flux-entrypoint.sh so the guard and the scheduled reboot can escalate
 # to the process that keeps the container alive.
@@ -37,32 +42,58 @@ FLUX_REST_TIMEOUT="${FLUX_REST_TIMEOUT:-10}"
 # --- logging ----------------------------------------------------------------
 flux_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-# One line to stdout (so it lands in `docker logs` and in the dashboard console)
-# and one to the persistent log, which is the only copy that survives the restart
-# we are about to cause.
-flux_log() {
-  local line
-  line="$(flux_now) [flux] $*"
-  printf '%s\n' "$line"
-  if [ -n "${FLUX_GUARD_LOG}" ]; then
-    # The braces matter: a redirection that cannot be opened reports itself on
-    # stderr before `|| true` gets a chance, and this runs every minute.
-    { printf '%s\n' "$line" >>"${FLUX_GUARD_LOG}"; } 2>/dev/null || true
+# One line to stdout (so it lands in `docker logs` and in the dashboard console) and, when FLUX_LOG
+# is set, to flux.log, the copy that survives the restart we are about to cause. Rotated at
+# FLUX_LOG_MAX_BYTES (the old file becomes flux.log.1). The braces matter in the write: a
+# redirection that cannot be opened reports itself on stderr before `|| true` gets a chance, and
+# this runs every minute.
+flux_log_raw() {
+  printf '%s\n' "$1"
+  if [ -n "${FLUX_LOG}" ] && mkdir -p "$(dirname "${FLUX_LOG}")" 2>/dev/null; then
+    { printf '%s\n' "$1" >>"${FLUX_LOG}"; } 2>/dev/null || return 0
+    flux_rotate_log "${FLUX_LOG}" "${FLUX_LOG_MAX_BYTES}"
   fi
+  return 0
 }
 
-# Keeps the persistent log bounded. Called once per guard cycle; a rewrite only
-# happens on the rare cycle where the file is actually over the limit.
-flux_log_rotate() {
-  local lines
-  [ -f "${FLUX_GUARD_LOG}" ] || return 0
-  lines=$(wc -l <"${FLUX_GUARD_LOG}" 2>/dev/null || echo 0)
-  [ "${lines:-0}" -gt "${FLUX_GUARD_LOG_MAX_LINES}" ] || return 0
-  if tail -n "$((FLUX_GUARD_LOG_MAX_LINES / 2))" "${FLUX_GUARD_LOG}" >"${FLUX_GUARD_LOG}.tmp" 2>/dev/null; then
-    mv "${FLUX_GUARD_LOG}.tmp" "${FLUX_GUARD_LOG}" 2>/dev/null || rm -f "${FLUX_GUARD_LOG}.tmp"
-  else
-    rm -f "${FLUX_GUARD_LOG}.tmp"
+flux_log() {
+  flux_log_raw "$(flux_now) [flux] $*"
+}
+
+# Moves $1 to $1.1 (replacing the previous one) once it is larger than $2 bytes.
+flux_rotate_log() {
+  local size
+  size="$(stat -c %s "$1" 2>/dev/null || echo 0)"
+  if [ "${size}" -gt "$2" ] 2>/dev/null; then
+    mv -f "$1" "$1.1" 2>/dev/null
   fi
+  return 0
+}
+
+# The start-up banner, through the normal log path (docker logs, the panel's log). ASCII only.
+# $1 = the game's name.
+flux_banner() {
+  local rule='====================================================================='
+  flux_log_raw "${rule}"
+  flux_log_raw " $1 server image by FluxCloud - https://runonflux.com"
+  flux_log_raw " Host this and 30+ other games in one click: https://runonflux.com/games"
+  flux_log_raw "${rule}"
+}
+
+# Once per start: a flux.log an older image left on the synced data volume ($@) is appended to
+# the new one and deleted there, so Syncthing stops carrying it.
+flux_log_migrate() {
+  local old
+  [ -n "${FLUX_LOG}" ] || return 0
+  for old in "$@"; do
+    [ -f "${old}" ] && [ "${old}" != "${FLUX_LOG}" ] || continue
+    mkdir -p "$(dirname "${FLUX_LOG}")" 2>/dev/null
+    if [ -s "${old}" ]; then
+      cat "${old}" >>"${FLUX_LOG}" 2>/dev/null || continue
+    fi
+    rm -f "${old}" "${old}.tmp"
+  done
+  return 0
 }
 
 # --- admin password ---------------------------------------------------------
